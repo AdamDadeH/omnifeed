@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "omnifeed"
+version = "0.1.0"
+description = "Unified content feed aggregator with personalized ranking"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "feedparser>=6.0.0",  # RSS/Atom parsing
+    "httpx>=0.27.0",      # HTTP client
+    "click>=8.0.0",       # CLI framework
+    "rich>=13.0.0",       # Terminal formatting
+    "fastapi>=0.100.0",   # API framework
+    "uvicorn>=0.20.0",    # ASGI server
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.1.0",
+    "mypy>=1.8.0",
+]
+
+[project.scripts]
+omni-feed = "omnifeed.cli:main"
+omni-feed-api = "uvicorn:main"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
