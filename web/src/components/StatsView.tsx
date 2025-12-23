@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
-import { getFeedbackStats } from '../api/client';
-import type { FeedbackStats } from '../api/types';
+import { getFeedbackStats, getModelStatus, trainModel } from '../api/client';
+import type { FeedbackStats, ModelStatus, TrainResult } from '../api/types';
 
 interface Props {
   onClose: () => void;
@@ -11,12 +11,19 @@ export function StatsView({ onClose, sourceId }: Props) {
   const [stats, setStats] = useState<FeedbackStats | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null);
+  const [training, setTraining] = useState(false);
+  const [trainResult, setTrainResult] = useState<TrainResult | null>(null);
 
   useEffect(() => {
     async function loadStats() {
       try {
-        const data = await getFeedbackStats(sourceId);
-        setStats(data);
+        const [feedbackData, modelData] = await Promise.all([
+          getFeedbackStats(sourceId),
+          getModelStatus(),
+        ]);
+        setStats(feedbackData);
+        setModelStatus(modelData);
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Failed to load stats');
       } finally {
@@ -25,6 +32,22 @@ export function StatsView({ onClose, sourceId }: Props) {
     }
     loadStats();
   }, [sourceId]);
+
+  const handleTrain = async () => {
+    setTraining(true);
+    setTrainResult(null);
+    try {
+      const result = await trainModel();
+      setTrainResult(result);
+      // Refresh model status
+      const status = await getModelStatus();
+      setModelStatus(status);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Training failed');
+    } finally {
+      setTraining(false);
+    }
+  };
 
   const formatDuration = (ms: number): string => {
     if (ms < 1000) return `${Math.round(ms)}ms`;
@@ -69,6 +92,69 @@ export function StatsView({ onClose, sourceId }: Props) {
 
           {stats && (
             <div className="space-y-6">
+              {/* Model Status */}
+              {modelStatus && (
+                <div className="bg-neutral-800 rounded-lg p-4">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h3 className="font-medium mb-1">Ranking Model</h3>
+                      <div className="text-sm text-neutral-400">
+                        {modelStatus.is_trained ? (
+                          <span className="text-green-400">Trained</span>
+                        ) : (
+                          <span className="text-yellow-400">Not trained</span>
+                        )}
+                        {modelStatus.source_count > 0 && (
+                          <span className="ml-2">
+                            ({modelStatus.source_count} source stats)
+                          </span>
+                        )}
+                      </div>
+                      {trainResult && (
+                        <div className="text-sm mt-2">
+                          {trainResult.status === 'success' ? (
+                            <span className="text-green-400">
+                              Trained on {trainResult.example_count} examples
+                              ({trainResult.click_examples} clicks, {trainResult.reward_examples} rated)
+                            </span>
+                          ) : (
+                            <div className="space-y-1">
+                              <div className="text-yellow-400">
+                                {trainResult.status}: {trainResult.example_count}/5 examples
+                              </div>
+                              {trainResult.issues && trainResult.issues.length > 0 && (
+                                <ul className="text-neutral-400 text-xs list-disc ml-4">
+                                  {trainResult.issues.map((issue, i) => (
+                                    <li key={i}>{issue}</li>
+                                  ))}
+                                </ul>
+                              )}
+                              {trainResult.items_with_embeddings !== undefined && (
+                                <div className="text-neutral-500 text-xs">
+                                  {trainResult.items_with_embeddings}/{trainResult.total_items} items have embeddings,{' '}
+                                  {trainResult.click_events} clicks, {trainResult.explicit_feedbacks} ratings
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                    <button
+                      onClick={handleTrain}
+                      disabled={training}
+                      className={`px-4 py-2 rounded font-medium transition-colors ${
+                        training
+                          ? 'bg-neutral-700 text-neutral-400 cursor-not-allowed'
+                          : 'bg-blue-600 hover:bg-blue-500 text-white'
+                      }`}
+                    >
+                      {training ? 'Training...' : 'Train Model'}
+                    </button>
+                  </div>
+                </div>
+              )}
+
               {/* Summary */}
               <div className="text-sm text-neutral-400">
                 {stats.total_events} total events

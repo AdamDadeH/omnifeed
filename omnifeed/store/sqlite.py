@@ -6,7 +6,10 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from omnifeed.models import Source, SourceInfo, SourceStatus, Item, ContentType, ConsumptionType, FeedbackEvent
+from omnifeed.models import (
+    Source, SourceInfo, SourceStatus, Item, ContentType, ConsumptionType,
+    FeedbackEvent, FeedbackDimension, FeedbackOption, ExplicitFeedback,
+)
 from omnifeed.store.base import Store
 
 
@@ -40,6 +43,8 @@ CREATE TABLE IF NOT EXISTS items (
     hidden INTEGER DEFAULT 0,
     series_id TEXT,
     series_position INTEGER,
+    embedding JSON,
+    embeddings JSON,
     UNIQUE(source_id, external_id)
 );
 
@@ -59,6 +64,41 @@ CREATE TABLE IF NOT EXISTS feedback_events (
 CREATE INDEX IF NOT EXISTS idx_feedback_item ON feedback_events(item_id);
 CREATE INDEX IF NOT EXISTS idx_feedback_type ON feedback_events(event_type);
 CREATE INDEX IF NOT EXISTS idx_feedback_timestamp ON feedback_events(timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS feedback_dimensions (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT,
+    allow_multiple INTEGER DEFAULT 0,
+    active INTEGER DEFAULT 1,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS feedback_options (
+    id TEXT PRIMARY KEY,
+    dimension_id TEXT NOT NULL REFERENCES feedback_dimensions(id),
+    label TEXT NOT NULL,
+    description TEXT,
+    sort_order INTEGER DEFAULT 0,
+    active INTEGER DEFAULT 1,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_options_dimension ON feedback_options(dimension_id);
+
+CREATE TABLE IF NOT EXISTS explicit_feedback (
+    id TEXT PRIMARY KEY,
+    item_id TEXT NOT NULL REFERENCES items(id),
+    timestamp TEXT NOT NULL,
+    reward_score REAL NOT NULL,
+    selections JSON,
+    notes TEXT,
+    completion_pct REAL,
+    is_checkpoint INTEGER DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_explicit_feedback_item ON explicit_feedback(item_id);
+CREATE INDEX IF NOT EXISTS idx_explicit_feedback_timestamp ON explicit_feedback(timestamp DESC);
 """
 
 
@@ -95,6 +135,15 @@ def _row_to_source(row: sqlite3.Row) -> Source:
 
 def _row_to_item(row: sqlite3.Row) -> Item:
     """Convert a database row to an Item."""
+    # Handle embeddings - try new format first, fall back to legacy
+    embeddings = []
+    try:
+        if row["embeddings"]:
+            embeddings = json.loads(row["embeddings"])
+    except (KeyError, IndexError):
+        # Column might not exist in older DBs
+        pass
+
     return Item(
         id=row["id"],
         source_id=row["source_id"],
@@ -111,6 +160,7 @@ def _row_to_item(row: sqlite3.Row) -> Item:
         hidden=bool(row["hidden"]),
         series_id=row["series_id"],
         series_position=row["series_position"],
+        embeddings=embeddings,
     )
 
 
@@ -129,6 +179,42 @@ class SQLiteStore(Store):
         """Create tables if not exist."""
         self._conn.executescript(SCHEMA)
         self._conn.commit()
+        self._migrate_schema()
+
+    def _migrate_schema(self) -> None:
+        """Apply any necessary schema migrations."""
+        cursor = self._conn.execute("PRAGMA table_info(items)")
+        columns = {row[1] for row in cursor.fetchall()}
+
+        # Add embeddings column if missing
+        if "embeddings" not in columns:
+            self._conn.execute("ALTER TABLE items ADD COLUMN embeddings JSON")
+            self._conn.commit()
+
+        # Migrate legacy embedding to embeddings list
+        if "embedding" in columns:
+            # Convert old single embedding to list format
+            cursor = self._conn.execute(
+                "SELECT id, embedding FROM items WHERE embedding IS NOT NULL AND embeddings IS NULL"
+            )
+            for row in cursor.fetchall():
+                item_id, old_embedding = row
+                if old_embedding:
+                    import json as json_mod
+                    try:
+                        vector = json_mod.loads(old_embedding) if isinstance(old_embedding, str) else old_embedding
+                        new_embeddings = [{
+                            "type": "text",
+                            "model": "all-MiniLM-L6-v2",
+                            "vector": vector,
+                        }]
+                        self._conn.execute(
+                            "UPDATE items SET embeddings = ? WHERE id = ?",
+                            (json_mod.dumps(new_embeddings), item_id)
+                        )
+                    except Exception:
+                        pass
+            self._conn.commit()
 
     # Sources
 
@@ -198,9 +284,9 @@ class SQLiteStore(Store):
             INSERT INTO items (
                 id, source_id, external_id, url, title, creator_name,
                 published_at, ingested_at, content_type, consumption_type,
-                metadata, seen, hidden, series_id, series_position
+                metadata, seen, hidden, series_id, series_position, embeddings
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(source_id, external_id) DO UPDATE SET
                 url = excluded.url,
                 title = excluded.title,
@@ -210,7 +296,8 @@ class SQLiteStore(Store):
                 consumption_type = excluded.consumption_type,
                 metadata = excluded.metadata,
                 series_id = excluded.series_id,
-                series_position = excluded.series_position
+                series_position = excluded.series_position,
+                embeddings = excluded.embeddings
             """,
             (
                 item.id,
@@ -228,6 +315,7 @@ class SQLiteStore(Store):
                 int(item.hidden),
                 item.series_id,
                 item.series_position,
+                json.dumps(item.embeddings) if item.embeddings else None,
             ),
         )
         self._conn.commit()
@@ -280,6 +368,15 @@ class SQLiteStore(Store):
         cursor = self._conn.execute(
             "SELECT * FROM items WHERE source_id = ? AND external_id = ?",
             (source_id, external_id),
+        )
+        row = cursor.fetchone()
+        return _row_to_item(row) if row else None
+
+    def get_item_by_url(self, url: str) -> Item | None:
+        """Get an item by URL (deduplication fallback)."""
+        cursor = self._conn.execute(
+            "SELECT * FROM items WHERE url = ?",
+            (url,),
         )
         row = cursor.fetchone()
         return _row_to_item(row) if row else None
@@ -379,6 +476,214 @@ class SQLiteStore(Store):
             )
             for row in cursor.fetchall()
         ]
+
+    # Feedback dimensions and options
+
+    def add_dimension(self, dimension: FeedbackDimension) -> None:
+        """Add a feedback dimension."""
+        self._conn.execute(
+            """
+            INSERT INTO feedback_dimensions (id, name, description, allow_multiple, active, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                dimension.id,
+                dimension.name,
+                dimension.description,
+                int(dimension.allow_multiple),
+                int(dimension.active),
+                _datetime_to_str(dimension.created_at),
+            ),
+        )
+        self._conn.commit()
+
+    def get_dimensions(self, active_only: bool = True) -> list[FeedbackDimension]:
+        """Get all feedback dimensions."""
+        if active_only:
+            cursor = self._conn.execute(
+                "SELECT * FROM feedback_dimensions WHERE active = 1 ORDER BY name"
+            )
+        else:
+            cursor = self._conn.execute("SELECT * FROM feedback_dimensions ORDER BY name")
+
+        return [
+            FeedbackDimension(
+                id=row["id"],
+                name=row["name"],
+                description=row["description"],
+                allow_multiple=bool(row["allow_multiple"]),
+                active=bool(row["active"]),
+                created_at=_str_to_datetime(row["created_at"]),
+            )
+            for row in cursor.fetchall()
+        ]
+
+    def get_dimension(self, dimension_id: str) -> FeedbackDimension | None:
+        """Get a dimension by ID."""
+        cursor = self._conn.execute(
+            "SELECT * FROM feedback_dimensions WHERE id = ?", (dimension_id,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return FeedbackDimension(
+            id=row["id"],
+            name=row["name"],
+            description=row["description"],
+            allow_multiple=bool(row["allow_multiple"]),
+            active=bool(row["active"]),
+            created_at=_str_to_datetime(row["created_at"]),
+        )
+
+    def add_option(self, option: FeedbackOption) -> None:
+        """Add an option to a dimension."""
+        self._conn.execute(
+            """
+            INSERT INTO feedback_options (id, dimension_id, label, description, sort_order, active, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                option.id,
+                option.dimension_id,
+                option.label,
+                option.description,
+                option.sort_order,
+                int(option.active),
+                _datetime_to_str(option.created_at),
+            ),
+        )
+        self._conn.commit()
+
+    def get_options(
+        self,
+        dimension_id: str | None = None,
+        active_only: bool = True,
+    ) -> list[FeedbackOption]:
+        """Get options, optionally filtered by dimension."""
+        conditions = []
+        params: list = []
+
+        if dimension_id is not None:
+            conditions.append("dimension_id = ?")
+            params.append(dimension_id)
+
+        if active_only:
+            conditions.append("active = 1")
+
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+
+        cursor = self._conn.execute(
+            f"SELECT * FROM feedback_options {where} ORDER BY sort_order, label",
+            params,
+        )
+
+        return [
+            FeedbackOption(
+                id=row["id"],
+                dimension_id=row["dimension_id"],
+                label=row["label"],
+                description=row["description"],
+                sort_order=row["sort_order"],
+                active=bool(row["active"]),
+                created_at=_str_to_datetime(row["created_at"]),
+            )
+            for row in cursor.fetchall()
+        ]
+
+    def update_option(self, option_id: str, active: bool) -> None:
+        """Update an option's active status."""
+        self._conn.execute(
+            "UPDATE feedback_options SET active = ? WHERE id = ?",
+            (int(active), option_id),
+        )
+        self._conn.commit()
+
+    # Explicit feedback
+
+    def add_explicit_feedback(self, feedback: ExplicitFeedback) -> None:
+        """Store explicit user feedback."""
+        self._conn.execute(
+            """
+            INSERT INTO explicit_feedback (
+                id, item_id, timestamp, reward_score, selections, notes, completion_pct, is_checkpoint
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                feedback.id,
+                feedback.item_id,
+                _datetime_to_str(feedback.timestamp),
+                feedback.reward_score,
+                json.dumps(feedback.selections),
+                feedback.notes,
+                feedback.completion_pct,
+                int(feedback.is_checkpoint),
+            ),
+        )
+        self._conn.commit()
+
+    def get_explicit_feedback(
+        self,
+        item_id: str | None = None,
+        limit: int = 100,
+    ) -> list[ExplicitFeedback]:
+        """Get explicit feedback, optionally filtered by item."""
+        conditions = []
+        params: list = []
+
+        if item_id is not None:
+            conditions.append("item_id = ?")
+            params.append(item_id)
+
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+
+        query = f"""
+            SELECT * FROM explicit_feedback
+            {where}
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """
+        params.append(limit)
+
+        cursor = self._conn.execute(query, params)
+        return [
+            ExplicitFeedback(
+                id=row["id"],
+                item_id=row["item_id"],
+                timestamp=_str_to_datetime(row["timestamp"]),
+                reward_score=row["reward_score"],
+                selections=json.loads(row["selections"]) if row["selections"] else {},
+                notes=row["notes"],
+                completion_pct=row["completion_pct"],
+                is_checkpoint=bool(row["is_checkpoint"]),
+            )
+            for row in cursor.fetchall()
+        ]
+
+    def get_item_feedback(self, item_id: str) -> ExplicitFeedback | None:
+        """Get the most recent explicit feedback for an item."""
+        cursor = self._conn.execute(
+            """
+            SELECT * FROM explicit_feedback
+            WHERE item_id = ?
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (item_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return ExplicitFeedback(
+            id=row["id"],
+            item_id=row["item_id"],
+            timestamp=_str_to_datetime(row["timestamp"]),
+            reward_score=row["reward_score"],
+            selections=json.loads(row["selections"]) if row["selections"] else {},
+            notes=row["notes"],
+            completion_pct=row["completion_pct"],
+            is_checkpoint=bool(row["is_checkpoint"]),
+        )
 
     # Lifecycle
 

@@ -22,11 +22,8 @@ function App() {
 
   const handleOpenItem = useCallback(async (item: FeedItem) => {
     setReadingItem(item);
-    // Mark as seen when opened
-    if (!item.seen) {
-      await markSeen(item.id);
-    }
-    // Record click event
+    // Don't mark as seen yet - only when user completes (clicks "Rate")
+    // Record click event for analytics
     await recordFeedback(item.id, 'click', {});
   }, []);
 
@@ -36,6 +33,10 @@ function App() {
   }, [handleRefresh]);
 
   const handleReadingFeedback = useCallback(async (feedback: ReadingFeedback) => {
+    // Mark as seen now that user completed the item
+    await markSeen(feedback.item_id);
+
+    // Record completion event
     await recordFeedback(feedback.item_id, 'reading_complete', {
       time_spent_ms: feedback.time_spent_ms,
       max_scroll_pct: feedback.max_scroll_pct,

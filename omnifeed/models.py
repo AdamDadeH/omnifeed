@@ -5,6 +5,9 @@ from datetime import datetime
 from typing import Any
 from enum import Enum
 
+# Import SourceInfo and RawItem from sources module (canonical definitions)
+from omnifeed.sources.base import SourceInfo, RawItem
+
 
 class SourceStatus(Enum):
     """Status of a content source."""
@@ -29,16 +32,6 @@ class ConsumptionType(Enum):
     ONE_SHOT = "one_shot"      # Read once (news, article)
     REPLAYABLE = "replayable"  # May revisit (music, video essay)
     SERIALIZED = "serialized"  # Part of a series (episode, chapter)
-
-
-@dataclass
-class SourceInfo:
-    """Metadata about a content source, resolved from a URL or identifier."""
-    source_type: str              # "rss", "youtube_channel", etc.
-    uri: str                      # Canonical identifier (feed URL, channel URL)
-    display_name: str
-    avatar_url: str | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -80,16 +73,6 @@ class Source:
 
 
 @dataclass
-class RawItem:
-    """Item as pulled from source, before normalization."""
-    external_id: str              # Platform-specific ID for deduplication
-    url: str
-    title: str
-    published_at: datetime
-    raw_metadata: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
 class Item:
     """Normalized content item stored in database."""
     id: str                       # Internal UUID
@@ -114,6 +97,10 @@ class Item:
     series_id: str | None = None
     series_position: int | None = None
 
+    # Content embeddings for ranking - list of typed embeddings
+    # Each entry: {"type": "text"|"audio"|"image", "model": "...", "vector": [...]}
+    embeddings: list[dict[str, Any]] = field(default_factory=list)
+
 
 @dataclass
 class FeedbackEvent:
@@ -123,3 +110,46 @@ class FeedbackEvent:
     timestamp: datetime
     event_type: str  # "click", "impression", "hide_temp", "hide_permanent", "save", etc.
     payload: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class FeedbackOption:
+    """An option within a feedback dimension."""
+    id: str
+    dimension_id: str
+    label: str
+    description: str | None = None
+    sort_order: int = 0
+    active: bool = True
+    created_at: datetime = field(default_factory=datetime.utcnow)
+
+
+@dataclass
+class FeedbackDimension:
+    """A configurable dimension for explicit feedback (e.g., reward_type, replayability)."""
+    id: str
+    name: str                     # "reward_type", "replayability"
+    description: str | None = None
+    allow_multiple: bool = False  # multi-select vs single
+    active: bool = True
+    created_at: datetime = field(default_factory=datetime.utcnow)
+
+
+@dataclass
+class ExplicitFeedback:
+    """User's explicit rating and categorization of content."""
+    id: str
+    item_id: str
+    timestamp: datetime
+
+    # Core rating: reward per unit time (0.0 - 5.0)
+    reward_score: float
+
+    # Dimension selections: dimension_id -> list of option_ids
+    # e.g., {"reward_type": ["entertainment", "curiosity"], "replayability": ["will_revisit"]}
+    selections: dict[str, list[str]] = field(default_factory=dict)
+
+    # Optional context
+    notes: str | None = None
+    completion_pct: float | None = None  # where they were when rating
+    is_checkpoint: bool = False          # periodic check-in vs final rating

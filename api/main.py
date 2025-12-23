@@ -57,6 +57,7 @@ class ItemResponse(BaseModel):
     seen: bool
     hidden: bool
     metadata: dict[str, Any]
+    score: float | None = None  # ML ranking score (click_prob * expected_reward)
 
 
 class FeedResponse(BaseModel):
@@ -122,6 +123,46 @@ class FeedbackStatsResponse(BaseModel):
     recent_events: list[FeedbackEventResponse]
 
 
+# Feedback dimensions and explicit feedback models
+
+class FeedbackOptionResponse(BaseModel):
+    id: str
+    dimension_id: str
+    label: str
+    description: str | None
+    sort_order: int
+    active: bool
+
+
+class FeedbackDimensionResponse(BaseModel):
+    id: str
+    name: str
+    description: str | None
+    allow_multiple: bool
+    active: bool
+    options: list[FeedbackOptionResponse]
+
+
+class ExplicitFeedbackRequest(BaseModel):
+    item_id: str
+    reward_score: float  # 0.0 - 5.0
+    selections: dict[str, list[str]] = {}  # dimension_id -> option_ids
+    notes: str | None = None
+    completion_pct: float | None = None
+    is_checkpoint: bool = False
+
+
+class ExplicitFeedbackResponse(BaseModel):
+    id: str
+    item_id: str
+    timestamp: datetime
+    reward_score: float
+    selections: dict[str, list[str]]
+    notes: str | None
+    completion_pct: float | None
+    is_checkpoint: bool
+
+
 # =============================================================================
 # Application state
 # =============================================================================
@@ -136,6 +177,64 @@ class AppState:
 state = AppState()
 
 
+def seed_feedback_dimensions(store: Store) -> None:
+    """Seed initial feedback dimensions if they don't exist."""
+    from omnifeed.models import FeedbackDimension, FeedbackOption
+
+    existing = store.get_dimensions(active_only=False)
+    existing_names = {d.name for d in existing}
+
+    # Seed reward_type dimension
+    if "reward_type" not in existing_names:
+        dim = FeedbackDimension(
+            id="reward_type",
+            name="reward_type",
+            description="What type of value did this content provide?",
+            allow_multiple=True,
+        )
+        store.add_dimension(dim)
+
+        options = [
+            ("entertainment", "Entertainment", "Pure enjoyment or fun", 0),
+            ("curiosity", "Curiosity", "Satisfied intellectual curiosity", 1),
+            ("foundational", "Foundational Knowledge", "Core knowledge or skills", 2),
+            ("expertise", "Targeted Expertise", "Specific expertise I need", 3),
+        ]
+        for opt_id, label, desc, order in options:
+            store.add_option(FeedbackOption(
+                id=f"reward_type_{opt_id}",
+                dimension_id="reward_type",
+                label=label,
+                description=desc,
+                sort_order=order,
+            ))
+
+    # Seed replayability dimension
+    if "replayability" not in existing_names:
+        dim = FeedbackDimension(
+            id="replayability",
+            name="replayability",
+            description="How likely are you to revisit this content?",
+            allow_multiple=False,
+        )
+        store.add_dimension(dim)
+
+        options = [
+            ("one_and_done", "One and Done", "Liked it but won't revisit", 0),
+            ("might_revisit", "Might Revisit", "Could see myself coming back", 1),
+            ("will_revisit", "Will Definitely Revisit", "So good I'll re-consume", 2),
+            ("reference", "Reference Material", "Will come back to look things up", 3),
+        ]
+        for opt_id, label, desc, order in options:
+            store.add_option(FeedbackOption(
+                id=f"replayability_{opt_id}",
+                dimension_id="replayability",
+                label=label,
+                description=desc,
+                sort_order=order,
+            ))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize and cleanup application state."""
@@ -143,6 +242,10 @@ async def lifespan(app: FastAPI):
     state.store = config.create_store()
     state.registry = create_default_registry()
     state.pipeline = create_default_pipeline()
+
+    # Seed initial feedback dimensions
+    seed_feedback_dimensions(state.store)
+
     yield
     state.store.close()
 
@@ -263,22 +366,34 @@ def poll_source(source_id: str):
     except ValueError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    new_count = 0
+    # Collect new items first
+    new_items: list[Item] = []
     for raw in raw_items:
+        # Check by external_id first
         existing = state.store.get_item_by_external_id(source_id, raw.external_id)
         if existing:
             continue
 
-        # Determine content type
+        # Also check by URL as a fallback (prevents dupes from format changes)
+        existing_by_url = state.store.get_item_by_url(raw.url)
+        if existing_by_url:
+            continue
+
+        # Determine content type based on source type or enclosures
         content_type = ContentType.ARTICLE
-        enclosures = raw.raw_metadata.get("enclosures", [])
-        for enc in enclosures:
-            if enc.get("type", "").startswith("audio"):
-                content_type = ContentType.AUDIO
-                break
-            elif enc.get("type", "").startswith("video"):
-                content_type = ContentType.VIDEO
-                break
+        if source.source_type in ("youtube_channel", "youtube_playlist"):
+            content_type = ContentType.VIDEO
+        elif source.source_type in ("bandcamp", "bandcamp_fan", "qobuz_artist", "qobuz_label"):
+            content_type = ContentType.AUDIO
+        else:
+            enclosures = raw.raw_metadata.get("enclosures", [])
+            for enc in enclosures:
+                if enc.get("type", "").startswith("audio"):
+                    content_type = ContentType.AUDIO
+                    break
+                elif enc.get("type", "").startswith("video"):
+                    content_type = ContentType.VIDEO
+                    break
 
         item = Item(
             id=uuid.uuid4().hex[:12],
@@ -293,15 +408,44 @@ def poll_source(source_id: str):
             consumption_type=ConsumptionType.ONE_SHOT,
             metadata=raw.raw_metadata,
         )
+        new_items.append(item)
+
+    # Generate embeddings for new items (batched)
+    if new_items:
+        import logging
+
+        # Text embeddings (title + description)
+        try:
+            from omnifeed.ranking.embeddings import get_embedding_service
+            embedding_service = get_embedding_service()
+            text_embeddings = embedding_service.embed_items(new_items)
+            for item, emb in zip(new_items, text_embeddings):
+                item.embeddings.append(emb)
+        except Exception as e:
+            logging.warning(f"Failed to generate text embeddings: {e}")
+
+        # Transcript embeddings for YouTube videos
+        if source.source_type in ("youtube_channel", "youtube_playlist"):
+            try:
+                from omnifeed.ranking.transcript_embeddings import embed_youtube_items
+                transcript_embeddings = embed_youtube_items(new_items)
+                for item in new_items:
+                    if item.id in transcript_embeddings:
+                        item.embeddings.append(transcript_embeddings[item.id])
+                logging.info(f"Generated {len(transcript_embeddings)} transcript embeddings")
+            except Exception as e:
+                logging.warning(f"Failed to generate transcript embeddings: {e}")
+
+    # Save items
+    for item in new_items:
         state.store.upsert_item(item)
-        new_count += 1
 
     state.store.update_source_poll_time(source_id, datetime.utcnow())
 
     return PollResult(
         source_id=source_id,
         source_name=source.display_name,
-        new_items=new_count,
+        new_items=len(new_items),
     )
 
 
@@ -337,6 +481,84 @@ def disable_source(source_id: str):
 
 
 # =============================================================================
+# Routes: Search
+# =============================================================================
+
+
+class SearchSuggestionResponse(BaseModel):
+    url: str
+    name: str
+    source_type: str
+    description: str
+    thumbnail_url: str | None
+    subscriber_count: int | None
+    provider: str
+    metadata: dict[str, Any]
+
+
+class SearchResponse(BaseModel):
+    query: str
+    results: list[SearchSuggestionResponse]
+    providers_used: list[str]
+
+
+@app.get("/api/search", response_model=SearchResponse)
+async def search_sources(
+    q: str = Query(..., min_length=1, description="Search query"),
+    providers: str | None = Query(None, description="Comma-separated provider IDs"),
+    limit: int = Query(10, ge=1, le=50, description="Max results per provider"),
+):
+    """Search for sources to add."""
+    from omnifeed.search import get_search_service
+
+    service = get_search_service()
+
+    # Parse provider filter
+    provider_ids = None
+    if providers:
+        provider_ids = [p.strip() for p in providers.split(",")]
+
+    # Run search
+    suggestions = await service.search(q, limit=limit, provider_ids=provider_ids)
+
+    return SearchResponse(
+        query=q,
+        results=[
+            SearchSuggestionResponse(
+                url=s.url,
+                name=s.name,
+                source_type=s.source_type,
+                description=s.description,
+                thumbnail_url=s.thumbnail_url,
+                subscriber_count=s.subscriber_count,
+                provider=s.provider,
+                metadata=s.metadata,
+            )
+            for s in suggestions
+        ],
+        providers_used=provider_ids or service.provider_ids,
+    )
+
+
+@app.get("/api/search/providers")
+def list_search_providers():
+    """List available search providers."""
+    from omnifeed.search import get_search_service
+
+    service = get_search_service()
+
+    return {
+        "providers": [
+            {
+                "id": p.provider_id,
+                "source_types": p.source_types,
+            }
+            for p in service.providers
+        ]
+    }
+
+
+# =============================================================================
 # Routes: Feed
 # =============================================================================
 
@@ -359,14 +581,17 @@ def get_feed(
         offset=offset,
     )
 
-    # Rank items
+    # Rank items and compute scores
     ranked = state.pipeline.rank(items)[:limit]
 
     # Get source names
     sources_map = {s.id: s for s in state.store.list_sources()}
 
-    item_responses = [
-        ItemResponse(
+    # Compute scores for display
+    item_responses = []
+    for item in ranked:
+        score = state.pipeline.score(item)
+        item_responses.append(ItemResponse(
             id=item.id,
             source_id=item.source_id,
             source_name=sources_map.get(item.source_id, type("", (), {"display_name": "Unknown"})).display_name,
@@ -378,9 +603,8 @@ def get_feed(
             seen=item.seen,
             hidden=item.hidden,
             metadata=item.metadata,
-        )
-        for item in ranked
-    ]
+            score=round(score, 3),
+        ))
 
     return FeedResponse(
         items=item_responses,
@@ -613,6 +837,318 @@ def get_feedback_stats(
             )
             for e in recent
         ],
+    )
+
+
+# =============================================================================
+# Routes: Feedback Dimensions
+# =============================================================================
+
+
+@app.get("/api/feedback/dimensions", response_model=list[FeedbackDimensionResponse])
+def list_dimensions():
+    """List all feedback dimensions with their options."""
+    dimensions = state.store.get_dimensions(active_only=True)
+
+    result = []
+    for dim in dimensions:
+        options = state.store.get_options(dimension_id=dim.id, active_only=True)
+        result.append(FeedbackDimensionResponse(
+            id=dim.id,
+            name=dim.name,
+            description=dim.description,
+            allow_multiple=dim.allow_multiple,
+            active=dim.active,
+            options=[
+                FeedbackOptionResponse(
+                    id=opt.id,
+                    dimension_id=opt.dimension_id,
+                    label=opt.label,
+                    description=opt.description,
+                    sort_order=opt.sort_order,
+                    active=opt.active,
+                )
+                for opt in options
+            ],
+        ))
+
+    return result
+
+
+# =============================================================================
+# Routes: Explicit Feedback
+# =============================================================================
+
+
+@app.post("/api/feedback/explicit", response_model=ExplicitFeedbackResponse)
+def record_explicit_feedback(request: ExplicitFeedbackRequest):
+    """Record explicit user feedback for an item."""
+    from omnifeed.models import ExplicitFeedback
+
+    # Verify item exists
+    item = state.store.get_item(request.item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    # Validate reward score range
+    if not 0.0 <= request.reward_score <= 5.0:
+        raise HTTPException(status_code=400, detail="Reward score must be between 0.0 and 5.0")
+
+    feedback = ExplicitFeedback(
+        id=uuid.uuid4().hex[:12],
+        item_id=request.item_id,
+        timestamp=datetime.utcnow(),
+        reward_score=request.reward_score,
+        selections=request.selections,
+        notes=request.notes,
+        completion_pct=request.completion_pct,
+        is_checkpoint=request.is_checkpoint,
+    )
+
+    state.store.add_explicit_feedback(feedback)
+
+    return ExplicitFeedbackResponse(
+        id=feedback.id,
+        item_id=feedback.item_id,
+        timestamp=feedback.timestamp,
+        reward_score=feedback.reward_score,
+        selections=feedback.selections,
+        notes=feedback.notes,
+        completion_pct=feedback.completion_pct,
+        is_checkpoint=feedback.is_checkpoint,
+    )
+
+
+@app.get("/api/feedback/explicit/{item_id}", response_model=ExplicitFeedbackResponse | None)
+def get_item_explicit_feedback(item_id: str):
+    """Get the most recent explicit feedback for an item."""
+    feedback = state.store.get_item_feedback(item_id)
+    if not feedback:
+        return None
+
+    return ExplicitFeedbackResponse(
+        id=feedback.id,
+        item_id=feedback.item_id,
+        timestamp=feedback.timestamp,
+        reward_score=feedback.reward_score,
+        selections=feedback.selections,
+        notes=feedback.notes,
+        completion_pct=feedback.completion_pct,
+        is_checkpoint=feedback.is_checkpoint,
+    )
+
+
+@app.get("/api/feedback/explicit", response_model=list[ExplicitFeedbackResponse])
+def list_explicit_feedback(
+    item_id: str | None = Query(None),
+    limit: int = Query(100, ge=1, le=1000),
+):
+    """List explicit feedback entries."""
+    feedbacks = state.store.get_explicit_feedback(item_id=item_id, limit=limit)
+
+    return [
+        ExplicitFeedbackResponse(
+            id=fb.id,
+            item_id=fb.item_id,
+            timestamp=fb.timestamp,
+            reward_score=fb.reward_score,
+            selections=fb.selections,
+            notes=fb.notes,
+            completion_pct=fb.completion_pct,
+            is_checkpoint=fb.is_checkpoint,
+        )
+        for fb in feedbacks
+    ]
+
+
+# =============================================================================
+# Routes: Model Training
+# =============================================================================
+
+
+class TrainResponse(BaseModel):
+    status: str
+    example_count: int = 0
+    click_examples: int = 0
+    reward_examples: int = 0
+    # Diagnostic fields (when insufficient_data)
+    total_items: int | None = None
+    items_with_embeddings: int | None = None
+    click_events: int | None = None
+    explicit_feedbacks: int | None = None
+    engaged_items: int | None = None
+    missing_embeddings: int | None = None
+    issues: list[str] | None = None
+
+
+@app.post("/api/model/train", response_model=TrainResponse)
+def train_ranking_model():
+    """Train the ranking model on engagement data."""
+    from omnifeed.ranking.model import get_ranking_model, DEFAULT_MODEL_PATH
+
+    model = get_ranking_model()
+
+    try:
+        result = model.train(state.store)
+        if result["status"] == "success":
+            model.save(DEFAULT_MODEL_PATH)
+        return TrainResponse(**result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/model/status")
+def get_model_status():
+    """Get the current model training status."""
+    from omnifeed.ranking.model import get_ranking_model, DEFAULT_MODEL_PATH
+
+    model = get_ranking_model()
+
+    return {
+        "is_trained": model.is_trained,
+        "source_count": len(model.source_stats),
+        "model_path": str(DEFAULT_MODEL_PATH),
+        "model_exists": DEFAULT_MODEL_PATH.exists(),
+    }
+
+
+class RefreshEmbeddingsResponse(BaseModel):
+    updated_count: int
+    skipped_count: int
+    failed_count: int
+
+
+@app.post("/api/model/refresh-embeddings", response_model=RefreshEmbeddingsResponse)
+def refresh_embeddings(
+    source_id: str | None = Query(None, description="Only refresh items from this source"),
+    force: bool = Query(False, description="Regenerate even if embedding exists"),
+    embedding_type: str = Query("text", description="Type of embedding to refresh"),
+):
+    """Regenerate embeddings for items."""
+    import logging
+    from omnifeed.ranking.embeddings import get_embedding_by_type
+
+    items = state.store.get_items(source_id=source_id, limit=10000)
+
+    # Filter items needing embeddings
+    if force:
+        to_embed = items
+    else:
+        to_embed = [
+            item for item in items
+            if not get_embedding_by_type(item.embeddings, embedding_type)
+        ]
+
+    if not to_embed:
+        return RefreshEmbeddingsResponse(updated_count=0, skipped_count=len(items), failed_count=0)
+
+    updated = 0
+    failed = 0
+
+    try:
+        from omnifeed.ranking.embeddings import get_embedding_service
+        embedding_service = get_embedding_service()
+
+        # Batch embed
+        new_embeddings = embedding_service.embed_items(to_embed)
+
+        for item, emb in zip(to_embed, new_embeddings):
+            try:
+                # Remove old embedding of same type if exists
+                item.embeddings = [e for e in item.embeddings if e.get("type") != embedding_type]
+                item.embeddings.append(emb)
+                state.store.upsert_item(item)
+                updated += 1
+            except Exception as e:
+                logging.warning(f"Failed to save embedding for {item.id}: {e}")
+                failed += 1
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Embedding generation failed: {e}")
+
+    return RefreshEmbeddingsResponse(
+        updated_count=updated,
+        skipped_count=len(items) - len(to_embed),
+        failed_count=failed,
+    )
+
+
+@app.post("/api/model/refresh-transcripts", response_model=RefreshEmbeddingsResponse)
+def refresh_transcript_embeddings(
+    source_id: str | None = Query(None, description="Only refresh items from this source"),
+    force: bool = Query(False, description="Regenerate even if transcript embedding exists"),
+):
+    """Generate transcript embeddings for YouTube videos."""
+    import logging
+    from omnifeed.ranking.embeddings import get_embedding_by_type
+    from omnifeed.ranking.transcript_embeddings import embed_transcript
+
+    # Get YouTube items
+    items = state.store.get_items(source_id=source_id, limit=10000)
+
+    # Filter to YouTube videos only
+    youtube_items = [
+        item for item in items
+        if item.metadata.get("video_id") or "youtube.com" in item.url
+    ]
+
+    if not youtube_items:
+        return RefreshEmbeddingsResponse(updated_count=0, skipped_count=len(items), failed_count=0)
+
+    # Filter items needing transcript embeddings
+    if force:
+        to_embed = youtube_items
+    else:
+        to_embed = [
+            item for item in youtube_items
+            if not get_embedding_by_type(item.embeddings, "transcript")
+        ]
+
+    if not to_embed:
+        return RefreshEmbeddingsResponse(
+            updated_count=0,
+            skipped_count=len(youtube_items),
+            failed_count=0,
+        )
+
+    updated = 0
+    failed = 0
+    no_transcript = 0
+
+    for item in to_embed:
+        video_id = item.metadata.get("video_id")
+        if not video_id:
+            # Extract from URL
+            import re
+            match = re.search(r'youtube\.com/watch\?v=([^&]+)', item.url)
+            if match:
+                video_id = match.group(1)
+
+        if not video_id:
+            failed += 1
+            continue
+
+        try:
+            emb = embed_transcript(video_id)
+            if emb:
+                # Remove old transcript embedding if exists
+                item.embeddings = [e for e in item.embeddings if e.get("type") != "transcript"]
+                item.embeddings.append(emb)
+                state.store.upsert_item(item)
+                updated += 1
+                logging.info(f"Transcript embedding for: {item.title[:40]}")
+            else:
+                no_transcript += 1
+        except Exception as e:
+            logging.warning(f"Failed transcript for {item.id}: {e}")
+            failed += 1
+
+    logging.info(f"Transcript embeddings: {updated} updated, {no_transcript} no transcript, {failed} failed")
+
+    return RefreshEmbeddingsResponse(
+        updated_count=updated,
+        skipped_count=len(youtube_items) - len(to_embed) + no_transcript,
+        failed_count=failed,
     )
 
 

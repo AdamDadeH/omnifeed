@@ -3,7 +3,10 @@
 from abc import ABC, abstractmethod
 from datetime import datetime
 
-from omnifeed.models import Source, SourceInfo, Item, FeedbackEvent
+from omnifeed.models import (
+    Source, SourceInfo, Item, FeedbackEvent,
+    FeedbackDimension, FeedbackOption, ExplicitFeedback,
+)
 
 
 class Store(ABC):
@@ -69,6 +72,11 @@ class Store(ABC):
         pass
 
     @abstractmethod
+    def get_item_by_url(self, url: str) -> Item | None:
+        """Get an item by URL (deduplication fallback)."""
+        pass
+
+    @abstractmethod
     def mark_seen(self, item_id: str, seen: bool = True) -> None:
         """Mark an item as seen or unseen."""
         pass
@@ -102,6 +110,61 @@ class Store(ABC):
         limit: int = 100,
     ) -> list[FeedbackEvent]:
         """Get feedback events with optional filters."""
+        pass
+
+    # Feedback dimensions and options
+    @abstractmethod
+    def add_dimension(self, dimension: FeedbackDimension) -> None:
+        """Add a feedback dimension."""
+        pass
+
+    @abstractmethod
+    def get_dimensions(self, active_only: bool = True) -> list[FeedbackDimension]:
+        """Get all feedback dimensions."""
+        pass
+
+    @abstractmethod
+    def get_dimension(self, dimension_id: str) -> FeedbackDimension | None:
+        """Get a dimension by ID."""
+        pass
+
+    @abstractmethod
+    def add_option(self, option: FeedbackOption) -> None:
+        """Add an option to a dimension."""
+        pass
+
+    @abstractmethod
+    def get_options(
+        self,
+        dimension_id: str | None = None,
+        active_only: bool = True,
+    ) -> list[FeedbackOption]:
+        """Get options, optionally filtered by dimension."""
+        pass
+
+    @abstractmethod
+    def update_option(self, option_id: str, active: bool) -> None:
+        """Update an option's active status."""
+        pass
+
+    # Explicit feedback
+    @abstractmethod
+    def add_explicit_feedback(self, feedback: ExplicitFeedback) -> None:
+        """Store explicit user feedback."""
+        pass
+
+    @abstractmethod
+    def get_explicit_feedback(
+        self,
+        item_id: str | None = None,
+        limit: int = 100,
+    ) -> list[ExplicitFeedback]:
+        """Get explicit feedback, optionally filtered by item."""
+        pass
+
+    @abstractmethod
+    def get_item_feedback(self, item_id: str) -> ExplicitFeedback | None:
+        """Get the most recent explicit feedback for an item."""
         pass
 
     # Lifecycle

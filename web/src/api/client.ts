@@ -136,3 +136,74 @@ export async function getFeedbackStats(sourceId?: string): Promise<import('./typ
   const query = params.toString();
   return fetchJson(`${API_BASE}/feedback/stats${query ? `?${query}` : ''}`);
 }
+
+// Feedback dimensions and explicit feedback
+
+export async function getFeedbackDimensions(): Promise<import('./types').FeedbackDimension[]> {
+  return fetchJson(`${API_BASE}/feedback/dimensions`);
+}
+
+export async function submitExplicitFeedback(
+  payload: import('./types').ExplicitFeedbackPayload
+): Promise<import('./types').ExplicitFeedback> {
+  return fetchJson(`${API_BASE}/feedback/explicit`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getItemExplicitFeedback(
+  itemId: string
+): Promise<import('./types').ExplicitFeedback | null> {
+  return fetchJson(`${API_BASE}/feedback/explicit/${itemId}`);
+}
+
+// Model
+
+export async function getModelStatus(): Promise<import('./types').ModelStatus> {
+  return fetchJson(`${API_BASE}/model/status`);
+}
+
+export async function trainModel(): Promise<import('./types').TrainResult> {
+  return fetchJson(`${API_BASE}/model/train`, {
+    method: 'POST',
+  });
+}
+
+export interface RefreshEmbeddingsResult {
+  updated_count: number;
+  skipped_count: number;
+  failed_count: number;
+}
+
+export async function refreshEmbeddings(): Promise<RefreshEmbeddingsResult> {
+  return fetchJson(`${API_BASE}/model/refresh-embeddings`, {
+    method: 'POST',
+  });
+}
+
+// Search / Source Discovery
+
+export interface SearchOptions {
+  providers?: string[];
+  limit?: number;
+}
+
+export async function searchSources(
+  query: string,
+  options: SearchOptions = {}
+): Promise<import('./types').SearchResponse> {
+  const params = new URLSearchParams();
+  params.set('q', query);
+  if (options.providers?.length) {
+    params.set('providers', options.providers.join(','));
+  }
+  if (options.limit) {
+    params.set('limit', options.limit.toString());
+  }
+  return fetchJson(`${API_BASE}/search?${params.toString()}`);
+}
+
+export async function getSearchProviders(): Promise<{ providers: import('./types').SearchProvider[] }> {
+  return fetchJson(`${API_BASE}/search/providers`);
+}

@@ -41,6 +41,23 @@ export function FeedItem({ item, onOpen, onMarkSeen, onHide }: Props) {
                   <span className="capitalize">{item.content_type}</span>
                 </>
               )}
+              {item.score !== null && (
+                <>
+                  <span>·</span>
+                  <span
+                    className={
+                      item.score >= 2.0
+                        ? 'text-green-500'
+                        : item.score >= 1.0
+                        ? 'text-yellow-500'
+                        : 'text-neutral-500'
+                    }
+                    title="ML ranking score"
+                  >
+                    {item.score.toFixed(2)}
+                  </span>
+                </>
+              )}
             </div>
 
             {/* Description preview */}

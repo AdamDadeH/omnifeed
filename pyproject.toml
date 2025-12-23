@@ -24,6 +24,16 @@ dev = [
     "ruff>=0.1.0",
     "mypy>=1.8.0",
 ]
+ml = [
+    "sentence-transformers>=2.2.0",
+    "torch>=2.0.0",
+    "scikit-learn>=1.3.0",
+]
+audio = [
+    "transformers>=4.30.0",
+    "librosa>=0.10.0",
+    "soundfile>=0.12.0",
+]
 
 [project.scripts]
 omni-feed = "omnifeed.cli:main"

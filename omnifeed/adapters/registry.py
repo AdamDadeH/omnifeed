@@ -33,9 +33,26 @@ class AdapterRegistry:
 
 
 def create_default_registry() -> AdapterRegistry:
-    """Create a registry with all default adapters."""
+    """Create a registry with all default adapters.
+
+    Order matters: first matching adapter is used.
+    Specific adapters registered before RSS to handle their URLs with APIs.
+    """
+    from omnifeed.adapters.bandcamp import BandcampAdapter, BandcampFanAdapter
+    from omnifeed.adapters.qobuz import QobuzAdapter, QobuzLabelAdapter
     from omnifeed.adapters.rss import RSSAdapter
+    from omnifeed.adapters.youtube import YouTubeAdapter
 
     registry = AdapterRegistry()
+
+    # Platform-specific adapters first (use dedicated APIs)
+    registry.register(YouTubeAdapter())
+    registry.register(BandcampAdapter())
+    registry.register(BandcampFanAdapter())
+    registry.register(QobuzAdapter())
+    registry.register(QobuzLabelAdapter())
+
+    # RSS adapter as fallback
     registry.register(RSSAdapter())
+
     return registry
