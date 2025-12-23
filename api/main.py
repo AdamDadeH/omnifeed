@@ -1162,6 +1162,146 @@ def refresh_transcript_embeddings(
 
 
 # =============================================================================
+# Routes: Discovery
+# =============================================================================
+
+
+class DiscoveryResultResponse(BaseModel):
+    url: str
+    name: str
+    source_type: str
+    description: str
+    thumbnail_url: str | None
+    subscriber_count: int | None
+    relevance_score: float
+    explanation: str
+    matched_interests: list[str]
+    from_query: str
+
+
+class InterestResponse(BaseModel):
+    topic: str
+    confidence: float
+    example_items: list[str]
+
+
+class InterestProfileResponse(BaseModel):
+    interests: list[InterestResponse]
+    top_creators: list[str]
+    content_types: list[str]
+    generated_queries: list[str]
+
+
+class DiscoveryResponse(BaseModel):
+    results: list[DiscoveryResultResponse]
+    queries_used: list[str]
+    interest_profile: InterestProfileResponse | None
+    mode: str
+
+
+@app.get("/api/discover", response_model=DiscoveryResponse)
+async def discover_sources(
+    prompt: str | None = Query(None, description="What to search for"),
+    limit: int = Query(10, ge=1, le=50),
+    platforms: str | None = Query(None, description="Comma-separated platforms"),
+):
+    """Discover new sources based on prompt or user interests.
+
+    If prompt is provided, searches for matching sources.
+    If no prompt, analyzes user's engagement history to suggest sources.
+    """
+    from omnifeed.discovery import DiscoveryEngine
+
+    engine = DiscoveryEngine(state.store)
+
+    platform_list = None
+    if platforms:
+        platform_list = [p.strip() for p in platforms.split(",")]
+
+    if prompt:
+        response = await engine.discover_from_prompt(
+            prompt=prompt,
+            limit=limit,
+            platforms=platform_list,
+        )
+    else:
+        response = await engine.discover_from_interests(limit=limit)
+
+    # Convert to response model
+    results = [
+        DiscoveryResultResponse(
+            url=r.suggestion.url,
+            name=r.suggestion.name,
+            source_type=r.suggestion.source_type,
+            description=r.suggestion.description,
+            thumbnail_url=r.suggestion.thumbnail_url,
+            subscriber_count=r.suggestion.subscriber_count,
+            relevance_score=r.relevance_score,
+            explanation=r.explanation,
+            matched_interests=r.matched_interests,
+            from_query=r.from_query,
+        )
+        for r in response.results
+    ]
+
+    profile_response = None
+    if response.interest_profile:
+        profile_response = InterestProfileResponse(
+            interests=[
+                InterestResponse(
+                    topic=i.topic,
+                    confidence=i.confidence,
+                    example_items=i.example_items,
+                )
+                for i in response.interest_profile.interests
+            ],
+            top_creators=response.interest_profile.top_creators,
+            content_types=response.interest_profile.content_types,
+            generated_queries=response.interest_profile.generated_queries,
+        )
+
+    return DiscoveryResponse(
+        results=results,
+        queries_used=response.queries_used,
+        interest_profile=profile_response,
+        mode=response.mode,
+    )
+
+
+@app.get("/api/discover/interests", response_model=InterestProfileResponse | None)
+def get_interest_profile(min_score: float = Query(3.0, description="Minimum feedback score")):
+    """Get user's extracted interest profile from engagement data."""
+    from omnifeed.discovery import build_interest_profile
+
+    profile = build_interest_profile(state.store, min_score=min_score)
+
+    if not profile:
+        return None
+
+    return InterestProfileResponse(
+        interests=[
+            InterestResponse(
+                topic=i.topic,
+                confidence=i.confidence,
+                example_items=i.example_items,
+            )
+            for i in profile.interests
+        ],
+        top_creators=profile.top_creators,
+        content_types=profile.content_types,
+        generated_queries=profile.generated_queries,
+    )
+
+
+@app.get("/api/discover/llm-status")
+def get_llm_status():
+    """Check LLM backend status for discovery."""
+    from omnifeed.discovery import get_llm_status as _get_status
+
+    return _get_status()
+
+
+# =============================================================================
 # Health check
 # =============================================================================
 

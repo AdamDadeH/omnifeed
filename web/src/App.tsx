@@ -2,7 +2,7 @@ import { useState, useCallback } from 'react';
 import { Sidebar, FeedList, AddSourceModal, ReaderPane, StatsView } from './components';
 import type { ReadingFeedback } from './components';
 import type { FeedItem } from './api/types';
-import { markSeen, recordFeedback } from './api/client';
+import { markSeen, recordFeedback, pollSource, pollAllSources } from './api/client';
 
 function App() {
   const [selectedSource, setSelectedSource] = useState<string | undefined>();
@@ -11,10 +11,29 @@ function App() {
   const [showStats, setShowStats] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
   const [readingItem, setReadingItem] = useState<FeedItem | null>(null);
+  const [polling, setPolling] = useState(false);
 
   const handleRefresh = useCallback(() => {
     setRefreshKey((k) => k + 1);
   }, []);
+
+  const handlePoll = useCallback(async () => {
+    setPolling(true);
+    try {
+      if (selectedSource) {
+        // Poll just the selected source
+        await pollSource(selectedSource);
+      } else {
+        // Poll all sources
+        await pollAllSources();
+      }
+      handleRefresh();
+    } catch (err) {
+      console.error('Failed to poll:', err);
+    } finally {
+      setPolling(false);
+    }
+  }, [selectedSource, handleRefresh]);
 
   const handleSourceAdded = useCallback(() => {
     handleRefresh();
@@ -82,10 +101,11 @@ function App() {
             </button>
 
             <button
-              onClick={handleRefresh}
-              className="px-3 py-1.5 text-sm bg-neutral-800 hover:bg-neutral-700 rounded transition-colors"
+              onClick={handlePoll}
+              disabled={polling}
+              className="px-3 py-1.5 text-sm bg-neutral-800 hover:bg-neutral-700 disabled:opacity-50 rounded transition-colors"
             >
-              Refresh
+              {polling ? 'Refreshing...' : selectedSource ? 'Refresh Source' : 'Refresh All'}
             </button>
           </div>
         </header>

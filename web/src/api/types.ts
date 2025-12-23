@@ -173,3 +173,47 @@ export interface SearchProvider {
   id: string;
   source_types: string[];
 }
+
+// Discovery
+
+export interface DiscoveryResult {
+  url: string;
+  name: string;
+  source_type: string;
+  description: string;
+  thumbnail_url: string | null;
+  subscriber_count: number | null;
+  relevance_score: number;
+  explanation: string;
+  matched_interests: string[];
+  from_query: string;
+}
+
+export interface Interest {
+  topic: string;
+  confidence: number;
+  example_items: string[];
+}
+
+export interface InterestProfile {
+  interests: Interest[];
+  top_creators: string[];
+  content_types: string[];
+  generated_queries: string[];
+}
+
+export interface DiscoveryResponse {
+  results: DiscoveryResult[];
+  queries_used: string[];
+  interest_profile: InterestProfile | null;
+  mode: 'prompt' | 'auto';
+}
+
+export interface LLMStatus {
+  current: string | null;
+  backends: {
+    ollama: { available: boolean; models: string[] };
+    openai: { available: boolean; model: string };
+    anthropic: { available: boolean; model: string };
+  };
+}

@@ -207,3 +207,32 @@ export async function searchSources(
 export async function getSearchProviders(): Promise<{ providers: import('./types').SearchProvider[] }> {
   return fetchJson(`${API_BASE}/search/providers`);
 }
+
+// Discovery
+
+export interface DiscoverOptions {
+  prompt?: string;
+  limit?: number;
+  platforms?: string[];
+}
+
+export async function discoverSources(
+  options: DiscoverOptions = {}
+): Promise<import('./types').DiscoveryResponse> {
+  const params = new URLSearchParams();
+  if (options.prompt) params.set('prompt', options.prompt);
+  if (options.limit) params.set('limit', options.limit.toString());
+  if (options.platforms?.length) {
+    params.set('platforms', options.platforms.join(','));
+  }
+  const query = params.toString();
+  return fetchJson(`${API_BASE}/discover${query ? `?${query}` : ''}`);
+}
+
+export async function getInterestProfile(): Promise<import('./types').InterestProfile | null> {
+  return fetchJson(`${API_BASE}/discover/interests`);
+}
+
+export async function getLLMStatus(): Promise<import('./types').LLMStatus> {
+  return fetchJson(`${API_BASE}/discover/llm-status`);
+}
