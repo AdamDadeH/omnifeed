@@ -571,23 +571,32 @@ def get_feed(
     offset: int = Query(0, ge=0),
 ):
     """Get the ranked feed."""
+    import logging
+
     seen_filter = None if show_seen else False
 
-    items = state.store.get_items(
+    # Use pipeline's retrieve_and_rank to score ALL candidates
+    ranked, stats = state.pipeline.retrieve_and_rank(
+        store=state.store,
         seen=seen_filter,
         hidden=False,
         source_id=source_id,
-        limit=limit * 2,  # Get more for ranking
-        offset=offset,
+        limit=limit + offset,  # Get enough for offset
     )
 
-    # Rank items and compute scores
-    ranked = state.pipeline.rank(items)[:limit]
+    # Apply offset
+    ranked = ranked[offset:]
+
+    # Log performance for monitoring
+    logging.info(
+        f"Feed request: {stats.scored_count} candidates, "
+        f"{stats.total_time_ms:.0f}ms total"
+    )
 
     # Get source names
     sources_map = {s.id: s for s in state.store.list_sources()}
 
-    # Compute scores for display
+    # Build response with scores
     item_responses = []
     for item in ranked:
         score = state.pipeline.score(item)
