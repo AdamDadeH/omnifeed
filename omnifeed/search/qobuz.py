@@ -1,6 +1,6 @@
 """Qobuz artist/label search provider."""
 
-from omnifeed.adapters.qobuz import get_qobuz_credentials, QOBUZ_API_BASE
+from omnifeed.sources.qobuz.adapter import get_qobuz_credentials, QOBUZ_API_BASE
 from omnifeed.search.base import SearchProvider, SourceSuggestion
 
 import httpx

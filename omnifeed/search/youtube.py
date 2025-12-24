@@ -2,7 +2,7 @@
 
 import httpx
 
-from omnifeed.adapters.youtube import get_api_key, YOUTUBE_API_BASE
+from omnifeed.sources.youtube.adapter import get_api_key, YOUTUBE_API_BASE
 from omnifeed.search.base import SearchProvider, SourceSuggestion
 
 
