@@ -62,6 +62,7 @@ export async function disableSource(sourceId: string): Promise<void> {
 export interface FeedOptions {
   showSeen?: boolean;
   sourceId?: string;
+  objective?: string;
   limit?: number;
   offset?: number;
 }
@@ -70,11 +71,29 @@ export async function getFeed(options: FeedOptions = {}): Promise<FeedResponse> 
   const params = new URLSearchParams();
   if (options.showSeen) params.set('show_seen', 'true');
   if (options.sourceId) params.set('source_id', options.sourceId);
+  if (options.objective) params.set('objective', options.objective);
   if (options.limit) params.set('limit', options.limit.toString());
   if (options.offset) params.set('offset', options.offset.toString());
 
   const query = params.toString();
   return fetchJson(`${API_BASE}/feed${query ? `?${query}` : ''}`);
+}
+
+// Objectives
+
+export interface Objective {
+  id: string;
+  label: string;
+  training_count: number;
+}
+
+export interface ObjectivesResponse {
+  objectives: Objective[];
+  active_model: string;
+}
+
+export async function getObjectives(): Promise<ObjectivesResponse> {
+  return fetchJson(`${API_BASE}/objectives`);
 }
 
 export async function getItem(itemId: string): Promise<FeedItem> {
@@ -164,8 +183,10 @@ export async function getModelStatus(): Promise<import('./types').ModelStatus> {
   return fetchJson(`${API_BASE}/model/status`);
 }
 
-export async function trainModel(): Promise<import('./types').TrainResult> {
-  return fetchJson(`${API_BASE}/model/train`, {
+export async function trainModel(modelName: string = 'all'): Promise<import('./types').TrainResult> {
+  const params = new URLSearchParams();
+  params.set('model_name', modelName);
+  return fetchJson(`${API_BASE}/model/train?${params.toString()}`, {
     method: 'POST',
   });
 }

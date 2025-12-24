@@ -12,8 +12,8 @@ export function StatsView({ onClose, sourceId }: Props) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null);
-  const [training, setTraining] = useState(false);
-  const [trainResult, setTrainResult] = useState<TrainResult | null>(null);
+  const [trainingModel, setTrainingModel] = useState<string | null>(null);
+  const [trainResults, setTrainResults] = useState<Record<string, TrainResult>>({});
 
   useEffect(() => {
     async function loadStats() {
@@ -33,19 +33,18 @@ export function StatsView({ onClose, sourceId }: Props) {
     loadStats();
   }, [sourceId]);
 
-  const handleTrain = async () => {
-    setTraining(true);
-    setTrainResult(null);
+  const handleTrain = async (modelName: string) => {
+    setTrainingModel(modelName);
     try {
-      const result = await trainModel();
-      setTrainResult(result);
+      const result = await trainModel(modelName);
+      setTrainResults((prev) => ({ ...prev, [modelName]: result }));
       // Refresh model status
       const status = await getModelStatus();
       setModelStatus(status);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Training failed');
     } finally {
-      setTraining(false);
+      setTrainingModel(null);
     }
   };
 
@@ -95,62 +94,78 @@ export function StatsView({ onClose, sourceId }: Props) {
               {/* Model Status */}
               {modelStatus && (
                 <div className="bg-neutral-800 rounded-lg p-4">
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <h3 className="font-medium mb-1">Ranking Model</h3>
-                      <div className="text-sm text-neutral-400">
-                        {modelStatus.is_trained ? (
-                          <span className="text-green-400">Trained</span>
-                        ) : (
-                          <span className="text-yellow-400">Not trained</span>
-                        )}
-                        {modelStatus.source_count > 0 && (
-                          <span className="ml-2">
-                            ({modelStatus.source_count} source stats)
-                          </span>
-                        )}
-                      </div>
-                      {trainResult && (
-                        <div className="text-sm mt-2">
-                          {trainResult.status === 'success' ? (
-                            <span className="text-green-400">
-                              Trained on {trainResult.example_count} examples
-                              ({trainResult.click_examples} clicks, {trainResult.reward_examples} rated)
-                            </span>
-                          ) : (
-                            <div className="space-y-1">
-                              <div className="text-yellow-400">
-                                {trainResult.status}: {trainResult.example_count}/5 examples
-                              </div>
-                              {trainResult.issues && trainResult.issues.length > 0 && (
-                                <ul className="text-neutral-400 text-xs list-disc ml-4">
-                                  {trainResult.issues.map((issue, i) => (
-                                    <li key={i}>{issue}</li>
-                                  ))}
-                                </ul>
-                              )}
-                              {trainResult.items_with_embeddings !== undefined && (
-                                <div className="text-neutral-500 text-xs">
-                                  {trainResult.items_with_embeddings}/{trainResult.total_items} items have embeddings,{' '}
-                                  {trainResult.click_events} clicks, {trainResult.explicit_feedbacks} ratings
-                                </div>
-                              )}
-                            </div>
-                          )}
-                        </div>
-                      )}
-                    </div>
+                  <div className="flex items-center justify-between mb-4">
+                    <h3 className="font-medium">Ranking Models</h3>
                     <button
-                      onClick={handleTrain}
-                      disabled={training}
-                      className={`px-4 py-2 rounded font-medium transition-colors ${
-                        training
+                      onClick={() => handleTrain('all')}
+                      disabled={trainingModel !== null}
+                      className={`px-3 py-1.5 text-sm rounded font-medium transition-colors ${
+                        trainingModel !== null
                           ? 'bg-neutral-700 text-neutral-400 cursor-not-allowed'
                           : 'bg-blue-600 hover:bg-blue-500 text-white'
                       }`}
                     >
-                      {training ? 'Training...' : 'Train Model'}
+                      {trainingModel === 'all' ? 'Training All...' : 'Train All'}
                     </button>
+                  </div>
+                  <div className="space-y-3">
+                    {Object.entries(modelStatus.models).map(([name, info]) => (
+                      <div key={name} className="flex items-center justify-between py-2 border-b border-neutral-700 last:border-0">
+                        <div className="flex-1">
+                          <div className="flex items-center gap-2">
+                            <span className="font-medium capitalize">{name.replace('_', ' ')}</span>
+                            {info.is_default && (
+                              <span className="text-xs px-1.5 py-0.5 bg-neutral-700 rounded">default</span>
+                            )}
+                            {info.supports_objectives && (
+                              <span className="text-xs px-1.5 py-0.5 bg-purple-900 text-purple-300 rounded">objectives</span>
+                            )}
+                          </div>
+                          <div className="text-sm text-neutral-400 mt-1">
+                            {info.is_trained ? (
+                              <span className="text-green-400">Trained</span>
+                            ) : (
+                              <span className="text-yellow-400">Not trained</span>
+                            )}
+                            {info.source_count !== undefined && info.source_count > 0 && (
+                              <span className="ml-2">({info.source_count} sources)</span>
+                            )}
+                            {info.objective_counts && Object.keys(info.objective_counts).length > 0 && (
+                              <span className="ml-2">
+                                ({Object.entries(info.objective_counts)
+                                  .filter(([, count]) => count > 0)
+                                  .map(([obj, count]) => `${obj}: ${count}`)
+                                  .join(', ')})
+                              </span>
+                            )}
+                          </div>
+                          {trainResults[name] && (
+                            <div className="text-sm mt-1">
+                              {trainResults[name].status === 'success' ? (
+                                <span className="text-green-400">
+                                  Trained on {trainResults[name].example_count} examples
+                                </span>
+                              ) : (
+                                <span className="text-yellow-400">
+                                  {trainResults[name].status}: {trainResults[name].example_count} examples
+                                </span>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                        <button
+                          onClick={() => handleTrain(name)}
+                          disabled={trainingModel !== null}
+                          className={`px-3 py-1.5 text-sm rounded transition-colors ${
+                            trainingModel !== null
+                              ? 'bg-neutral-700 text-neutral-400 cursor-not-allowed'
+                              : 'bg-neutral-700 hover:bg-neutral-600 text-white'
+                          }`}
+                        >
+                          {trainingModel === name ? 'Training...' : 'Train'}
+                        </button>
+                      </div>
+                    ))}
                   </div>
                 </div>
               )}

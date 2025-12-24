@@ -1,8 +1,9 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { Sidebar, FeedList, AddSourceModal, ReaderPane, StatsView } from './components';
 import type { ReadingFeedback } from './components';
 import type { FeedItem } from './api/types';
-import { markSeen, recordFeedback, pollSource, pollAllSources } from './api/client';
+import { markSeen, recordFeedback, pollSource, pollAllSources, getObjectives } from './api/client';
+import type { Objective } from './api/client';
 
 function App() {
   const [selectedSource, setSelectedSource] = useState<string | undefined>();
@@ -12,6 +13,15 @@ function App() {
   const [refreshKey, setRefreshKey] = useState(0);
   const [readingItem, setReadingItem] = useState<FeedItem | null>(null);
   const [polling, setPolling] = useState(false);
+  const [objectives, setObjectives] = useState<Objective[]>([]);
+  const [selectedObjective, setSelectedObjective] = useState<string | undefined>();
+
+  // Load objectives on mount
+  useEffect(() => {
+    getObjectives().then((data) => {
+      setObjectives(data.objectives);
+    }).catch(console.error);
+  }, []);
 
   const handleRefresh = useCallback(() => {
     setRefreshKey((k) => k + 1);
@@ -83,6 +93,22 @@ function App() {
           </h2>
 
           <div className="flex items-center gap-4">
+            {/* Objective selector */}
+            {objectives.length > 0 && (
+              <select
+                value={selectedObjective || ''}
+                onChange={(e) => setSelectedObjective(e.target.value || undefined)}
+                className="px-3 py-1.5 text-sm bg-neutral-800 hover:bg-neutral-700 rounded border border-neutral-700 text-neutral-200"
+              >
+                <option value="">All objectives</option>
+                {objectives.map((obj) => (
+                  <option key={obj.id} value={obj.id}>
+                    {obj.label} {obj.training_count > 0 ? `(${obj.training_count})` : ''}
+                  </option>
+                ))}
+              </select>
+            )}
+
             <label className="flex items-center gap-2 text-sm text-neutral-400">
               <input
                 type="checkbox"
@@ -115,6 +141,7 @@ function App() {
           <FeedList
             sourceFilter={selectedSource}
             showSeen={showSeen}
+            objective={selectedObjective}
             refreshKey={refreshKey}
             onOpenItem={handleOpenItem}
           />

@@ -577,6 +577,7 @@ def list_search_providers():
 def get_feed(
     show_seen: bool = Query(False, description="Include seen items"),
     source_id: str | None = Query(None, description="Filter by source"),
+    objective: str | None = Query(None, description="Ranking objective (entertainment, curiosity, etc.)"),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ):
@@ -592,6 +593,7 @@ def get_feed(
         hidden=False,
         source_id=source_id,
         limit=limit + offset,  # Get enough for offset
+        objective=objective,
     )
 
     # Apply offset
@@ -609,7 +611,7 @@ def get_feed(
     # Build response with scores
     item_responses = []
     for item in ranked:
-        score = state.pipeline.score(item)
+        score = state.pipeline.score(item, objective=objective)
 
         # Get attributions
         attributions = state.store.get_attributions(item.id)
@@ -1080,8 +1082,10 @@ def list_explicit_feedback(
 class TrainResponse(BaseModel):
     status: str
     example_count: int = 0
-    click_examples: int = 0
-    reward_examples: int = 0
+    click_examples: int | None = None
+    reward_examples: int | None = None
+    embedding_types: list[str] | None = None
+    objective_counts: dict[str, int] | None = None
     # Diagnostic fields (when insufficient_data)
     total_items: int | None = None
     items_with_embeddings: int | None = None
@@ -1093,33 +1097,108 @@ class TrainResponse(BaseModel):
 
 
 @app.post("/api/model/train", response_model=TrainResponse)
-def train_ranking_model():
-    """Train the ranking model on engagement data."""
-    from omnifeed.ranking.model import get_ranking_model, DEFAULT_MODEL_PATH
+def train_ranking_model(
+    model_name: str = Query("default", description="Model to train: default, multi_objective, or all"),
+):
+    """Train ranking model(s) on engagement data."""
+    from omnifeed.ranking.model_registry import get_model_registry
 
-    model = get_ranking_model()
+    registry = get_model_registry()
+    results = {}
 
     try:
-        result = model.train(state.store)
-        if result["status"] == "success":
-            model.save(DEFAULT_MODEL_PATH)
-        return TrainResponse(**result)
+        models_to_train = []
+        if model_name == "all":
+            models_to_train = [m["name"] for m in registry.list_models()]
+        else:
+            models_to_train = [model_name]
+
+        for name in models_to_train:
+            result = registry.train_model(name, state.store)
+            if "message" in result and result.get("status") == "error":
+                raise HTTPException(status_code=400, detail=result["message"])
+            results[name] = result
+
+        if not results:
+            raise HTTPException(status_code=400, detail=f"Unknown model: {model_name}")
+
+        # Return first result for backwards compat
+        first_result = list(results.values())[0]
+        return TrainResponse(
+            status=first_result.get("status", "error"),
+            example_count=first_result.get("example_count", 0),
+            click_examples=first_result.get("click_examples"),
+            reward_examples=first_result.get("reward_examples"),
+            embedding_types=first_result.get("embedding_types"),
+            objective_counts=first_result.get("objective_counts"),
+        )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/model/status")
 def get_model_status():
-    """Get the current model training status."""
-    from omnifeed.ranking.model import get_ranking_model, DEFAULT_MODEL_PATH
+    """Get status of all registered models."""
+    from omnifeed.ranking.model_registry import get_model_registry
+    from pathlib import Path
 
-    model = get_ranking_model()
+    registry = get_model_registry()
+    models_info = registry.list_models()
+
+    # Build detailed status per model
+    models = {}
+    for info in models_info:
+        model = registry.get_model(info["name"])
+        model_data = {
+            "is_trained": model.is_trained if model else False,
+            "model_exists": Path(info["path"]).exists(),
+            "supports_objectives": info["supports_objectives"],
+            "is_default": info["is_default"],
+        }
+        # Add model-specific stats if available
+        if model and hasattr(model, "source_stats"):
+            model_data["source_count"] = len(model.source_stats)
+        if model and hasattr(model, "training_counts"):
+            model_data["objective_counts"] = model.training_counts
+        models[info["name"]] = model_data
+
+    return {"models": models}
+
+
+@app.get("/api/objectives")
+def get_objectives():
+    """Get available ranking objectives."""
+    from omnifeed.ranking.model_registry import get_model_registry
+    from omnifeed.ranking.multi_objective import OBJECTIVE_TYPES, OBJECTIVE_LABELS
+
+    registry = get_model_registry()
+
+    # Get training counts from multi-objective model if available
+    training_counts = {}
+    mo_model = registry.get_model("multi_objective")
+    if mo_model and hasattr(mo_model, "training_counts"):
+        training_counts = mo_model.training_counts
+
+    # Determine which model would be used for objectives
+    active_model = None
+    for obj_id in OBJECTIVE_TYPES:
+        model, model_name = registry.get_model_for_objective(obj_id)
+        if model and model.is_trained:
+            active_model = model_name
+            break
 
     return {
-        "is_trained": model.is_trained,
-        "source_count": len(model.source_stats),
-        "model_path": str(DEFAULT_MODEL_PATH),
-        "model_exists": DEFAULT_MODEL_PATH.exists(),
+        "objectives": [
+            {
+                "id": obj_id,
+                "label": OBJECTIVE_LABELS.get(obj_id, obj_id),
+                "training_count": training_counts.get(obj_id, 0),
+            }
+            for obj_id in OBJECTIVE_TYPES
+        ],
+        "active_model": active_model or "default",
     }
 
 

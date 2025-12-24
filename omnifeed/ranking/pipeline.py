@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from omnifeed.models import Item
 from omnifeed.ranking.embeddings import get_embedding_by_type
 from omnifeed.ranking.registry import FeatureRegistry
+from omnifeed.ranking.model_registry import get_model_registry
 
 if TYPE_CHECKING:
     from omnifeed.store import Store
@@ -120,37 +121,38 @@ class RankingPipeline:
         self.feature_registry = feature_registry or FeatureRegistry()
         self.retriever = retriever or AllRetriever()
         self.use_ml_model = use_ml_model
-        self._ranking_model = None
 
-    def _get_ranking_model(self):
-        """Get the trained ranking model (lazy load)."""
-        if self._ranking_model is None and self.use_ml_model:
-            try:
-                from omnifeed.ranking.model import get_ranking_model
-                self._ranking_model = get_ranking_model()
-            except Exception as e:
-                logger.warning(f"Failed to load ranking model: {e}")
-                self._ranking_model = False  # Marker for failed load
-        return self._ranking_model if self._ranking_model else None
-
-    def score(self, item: Item) -> float:
+    def score(self, item: Item, objective: str | None = None) -> float:
         """Score a single item.
+
+        Args:
+            item: The item to score
+            objective: Optional objective to optimize for (entertainment, curiosity, etc.)
+                      Registry maps objectives to appropriate models.
 
         Uses ML model if trained, otherwise falls back to recency.
         """
-        # Try ML model first
-        model = self._get_ranking_model()
+        if not self.use_ml_model:
+            return self._recency_score(item)
+
+        # Get model from registry (handles objective -> model mapping)
+        registry = get_model_registry()
+        model, model_name = registry.get_model_for_objective(objective)
+
         if model and model.is_trained and get_embedding_by_type(item.embeddings, "text"):
             try:
-                return model.score(item)
+                return model.score(item, objective=objective)
             except Exception as e:
-                logger.warning(f"ML scoring failed: {e}")
+                logger.warning(f"ML scoring failed ({model_name}): {e}")
 
         # Fallback: recency-based scoring
+        return self._recency_score(item)
+
+    def _recency_score(self, item: Item) -> float:
+        """Compute recency-based score."""
         age_seconds = (datetime.utcnow() - item.published_at).total_seconds()
         # Normalize to roughly 0-5 range (1 day old = ~2.5)
-        recency_score = max(0, 5 - (age_seconds / 86400))
-        return recency_score
+        return max(0, 5 - (age_seconds / 86400))
 
     def rank(self, items: list[Item]) -> list[Item]:
         """Return items sorted by score descending."""
@@ -163,6 +165,7 @@ class RankingPipeline:
         hidden: bool = False,
         source_id: str | None = None,
         limit: int = 50,
+        objective: str | None = None,
     ) -> tuple[list[Item], RankingStats]:
         """Full pipeline: retrieve candidates, score, rank, return top.
 
@@ -172,6 +175,7 @@ class RankingPipeline:
             hidden: Filter by hidden status
             source_id: Filter by source
             limit: Number of items to return
+            objective: Ranking objective (e.g., entertainment, curiosity)
 
         Returns:
             (ranked_items, stats)
@@ -186,7 +190,7 @@ class RankingPipeline:
 
         # Step 2: Score all candidates
         t1 = time.perf_counter()
-        scored = [(item, self.score(item)) for item in items]
+        scored = [(item, self.score(item, objective=objective)) for item in items]
         score_time_ms = (time.perf_counter() - t1) * 1000
 
         # Step 3: Sort by score

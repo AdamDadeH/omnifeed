@@ -128,11 +128,17 @@ export interface ExplicitFeedbackPayload {
 
 // Model status and training
 
-export interface ModelStatus {
+export interface ModelInfo {
   is_trained: boolean;
-  source_count: number;
-  model_path: string;
   model_exists: boolean;
+  supports_objectives: boolean;
+  is_default: boolean;
+  source_count?: number;
+  objective_counts?: Record<string, number>;
+}
+
+export interface ModelStatus {
+  models: Record<string, ModelInfo>;
 }
 
 export interface TrainResult {

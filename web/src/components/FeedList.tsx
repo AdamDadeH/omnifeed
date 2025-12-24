@@ -6,11 +6,12 @@ import { FeedItem } from './FeedItem';
 interface Props {
   sourceFilter?: string;
   showSeen: boolean;
+  objective?: string;
   refreshKey: number;
   onOpenItem: (item: FeedItemType) => void;
 }
 
-export function FeedList({ sourceFilter, showSeen, refreshKey, onOpenItem }: Props) {
+export function FeedList({ sourceFilter, showSeen, objective, refreshKey, onOpenItem }: Props) {
   const [feed, setFeed] = useState<FeedResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -22,6 +23,7 @@ export function FeedList({ sourceFilter, showSeen, refreshKey, onOpenItem }: Pro
       const data = await getFeed({
         showSeen,
         sourceId: sourceFilter,
+        objective,
         limit: 50,
       });
       setFeed(data);
@@ -30,7 +32,7 @@ export function FeedList({ sourceFilter, showSeen, refreshKey, onOpenItem }: Pro
     } finally {
       setLoading(false);
     }
-  }, [showSeen, sourceFilter]);
+  }, [showSeen, sourceFilter, objective]);
 
   useEffect(() => {
     loadFeed();
