@@ -24,6 +24,12 @@ class ContentType(Enum):
     PAPER = "paper"
     IMAGE = "image"
     THREAD = "thread"
+    # Long-form media (may not have direct URL)
+    BOOK = "book"
+    GAME = "game"
+    SHOW = "show"      # TV series
+    FILM = "film"
+    PODCAST = "podcast"  # Series-level (vs individual audio episodes)
     OTHER = "other"
 
 
@@ -76,9 +82,9 @@ class Source:
 class Item:
     """Normalized content item stored in database."""
     id: str                       # Internal UUID
-    source_id: str
-    external_id: str              # Platform-specific ID
-    url: str
+    source_id: str                # Primary source (first discovered from)
+    external_id: str              # Platform-specific ID (from primary source)
+    url: str                      # May be empty for books/games without direct URL
     title: str
     creator_name: str
     published_at: datetime
@@ -88,6 +94,10 @@ class Item:
 
     # Extensible metadata - common fields extracted, rest preserved
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    # Canonical identifiers for deduplication across sources
+    # Keys: "isbn", "isbn13", "imdb", "tmdb", "igdb", "steam", "openlibrary", etc.
+    canonical_ids: dict[str, str] = field(default_factory=dict)
 
     # User state (MVP - simple flags, no separate UserItemState table yet)
     seen: bool = False
@@ -100,6 +110,26 @@ class Item:
     # Content embeddings for ranking - list of typed embeddings
     # Each entry: {"type": "text"|"audio"|"image", "model": "...", "vector": [...]}
     embeddings: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class ItemAttribution:
+    """Tracks which sources recommended an item.
+
+    Enables provenance: "This book was recommended by Hugo Awards, NYT Books, and @friend"
+    An item can have multiple attributions from different sources.
+    """
+    id: str
+    item_id: str
+    source_id: str
+    discovered_at: datetime
+
+    # Optional context about the recommendation
+    rank: int | None = None           # Position in list (1 = top)
+    context: str | None = None        # "Winner - Best Novel 2024", "Staff Pick"
+
+    # Metadata from the source about this recommendation
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

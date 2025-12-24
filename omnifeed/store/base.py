@@ -6,6 +6,7 @@ from datetime import datetime
 from omnifeed.models import (
     Source, SourceInfo, Item, FeedbackEvent,
     FeedbackDimension, FeedbackOption, ExplicitFeedback,
+    ItemAttribution,
 )
 
 
@@ -74,6 +75,16 @@ class Store(ABC):
     @abstractmethod
     def get_item_by_url(self, url: str) -> Item | None:
         """Get an item by URL (deduplication fallback)."""
+        pass
+
+    @abstractmethod
+    def get_item_by_canonical_id(self, id_type: str, id_value: str) -> Item | None:
+        """Find an item by canonical ID (ISBN, IMDB, etc.)."""
+        pass
+
+    @abstractmethod
+    def find_items_by_canonical_ids(self, canonical_ids: dict[str, str]) -> Item | None:
+        """Find an existing item that matches any of the provided canonical IDs."""
         pass
 
     @abstractmethod
@@ -165,6 +176,27 @@ class Store(ABC):
     @abstractmethod
     def get_item_feedback(self, item_id: str) -> ExplicitFeedback | None:
         """Get the most recent explicit feedback for an item."""
+        pass
+
+    # Item attributions
+    @abstractmethod
+    def add_attribution(self, attribution: ItemAttribution) -> None:
+        """Add an attribution linking an item to a source."""
+        pass
+
+    @abstractmethod
+    def get_attributions(self, item_id: str) -> list[ItemAttribution]:
+        """Get all attributions for an item."""
+        pass
+
+    @abstractmethod
+    def get_attribution(self, item_id: str, source_id: str) -> ItemAttribution | None:
+        """Get a specific attribution for an item from a source."""
+        pass
+
+    @abstractmethod
+    def get_items_by_source_attribution(self, source_id: str, limit: int = 50) -> list[Item]:
+        """Get items attributed to a source (even if not the primary source)."""
         pass
 
     # Lifecycle

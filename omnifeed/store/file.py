@@ -9,6 +9,7 @@ from typing import Any
 from omnifeed.models import (
     Source, SourceInfo, SourceStatus, Item, ContentType, ConsumptionType,
     FeedbackEvent, FeedbackDimension, FeedbackOption, ExplicitFeedback,
+    ItemAttribution,
 )
 from omnifeed.store.base import Store
 
@@ -74,11 +75,12 @@ def _item_to_dict(item: Item) -> dict[str, Any]:
         "content_type": item.content_type.value,
         "consumption_type": item.consumption_type.value,
         "metadata": item.metadata,
+        "canonical_ids": item.canonical_ids,
         "seen": item.seen,
         "hidden": item.hidden,
         "series_id": item.series_id,
         "series_position": item.series_position,
-        "embedding": item.embedding,
+        "embeddings": item.embeddings,
     }
 
 
@@ -96,11 +98,12 @@ def _dict_to_item(d: dict[str, Any]) -> Item:
         content_type=ContentType(d["content_type"]),
         consumption_type=ConsumptionType(d.get("consumption_type", "one_shot")),
         metadata=d.get("metadata", {}),
+        canonical_ids=d.get("canonical_ids", {}),
         seen=d.get("seen", False),
         hidden=d.get("hidden", False),
         series_id=d.get("series_id"),
         series_position=d.get("series_position"),
-        embedding=d.get("embedding"),
+        embeddings=d.get("embeddings", []),
     )
 
 
@@ -137,6 +140,7 @@ class FileStore(Store):
         self.dimensions_file = self.data_dir / "dimensions.json"
         self.options_file = self.data_dir / "options.json"
         self.explicit_feedback_file = self.data_dir / "explicit_feedback.json"
+        self.attributions_file = self.data_dir / "attributions.json"
 
         self._sources: dict[str, Source] = {}
         self._items: dict[str, Item] = {}
@@ -144,6 +148,7 @@ class FileStore(Store):
         self._dimensions: dict[str, FeedbackDimension] = {}
         self._options: dict[str, FeedbackOption] = {}
         self._explicit_feedback: list[ExplicitFeedback] = []
+        self._attributions: dict[str, ItemAttribution] = {}  # key: "{item_id}:{source_id}"
         self._load()
 
     def _load(self) -> None:
@@ -172,6 +177,13 @@ class FileStore(Store):
             data = json.loads(self.explicit_feedback_file.read_text())
             self._explicit_feedback = [self._dict_to_explicit_feedback(f) for f in data]
 
+        if self.attributions_file.exists():
+            data = json.loads(self.attributions_file.read_text())
+            for a in data:
+                attr = self._dict_to_attribution(a)
+                key = f"{attr.item_id}:{attr.source_id}"
+                self._attributions[key] = attr
+
     def _save(self) -> None:
         """Persist data to JSON files."""
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -193,6 +205,9 @@ class FileStore(Store):
 
         explicit_data = [self._explicit_feedback_to_dict(f) for f in self._explicit_feedback]
         self.explicit_feedback_file.write_text(json.dumps(explicit_data, indent=2))
+
+        attributions_data = [self._attribution_to_dict(a) for a in self._attributions.values()]
+        self.attributions_file.write_text(json.dumps(attributions_data, indent=2))
 
     def _dimension_to_dict(self, dim: FeedbackDimension) -> dict[str, Any]:
         return {
@@ -258,6 +273,28 @@ class FileStore(Store):
             notes=d.get("notes"),
             completion_pct=d.get("completion_pct"),
             is_checkpoint=d.get("is_checkpoint", False),
+        )
+
+    def _attribution_to_dict(self, attr: ItemAttribution) -> dict[str, Any]:
+        return {
+            "id": attr.id,
+            "item_id": attr.item_id,
+            "source_id": attr.source_id,
+            "discovered_at": _datetime_to_str(attr.discovered_at),
+            "rank": attr.rank,
+            "context": attr.context,
+            "metadata": attr.metadata,
+        }
+
+    def _dict_to_attribution(self, d: dict[str, Any]) -> ItemAttribution:
+        return ItemAttribution(
+            id=d["id"],
+            item_id=d["item_id"],
+            source_id=d["source_id"],
+            discovered_at=_str_to_datetime(d["discovered_at"]),
+            rank=d.get("rank"),
+            context=d.get("context"),
+            metadata=d.get("metadata", {}),
         )
 
     # Sources
@@ -498,6 +535,50 @@ class FileStore(Store):
         if not fb:
             return None
         return max(fb, key=lambda f: f.timestamp)
+
+    # Canonical ID lookup for deduplication
+
+    def get_item_by_canonical_id(self, id_type: str, id_value: str) -> Item | None:
+        """Find an item by canonical ID (ISBN, IMDB, etc.)."""
+        for item in self._items.values():
+            if item.canonical_ids.get(id_type) == id_value:
+                return item
+        return None
+
+    def find_items_by_canonical_ids(self, canonical_ids: dict[str, str]) -> Item | None:
+        """Find an existing item that matches any of the provided canonical IDs."""
+        for id_type, id_value in canonical_ids.items():
+            item = self.get_item_by_canonical_id(id_type, id_value)
+            if item:
+                return item
+        return None
+
+    # Item attributions
+
+    def add_attribution(self, attribution: ItemAttribution) -> None:
+        """Add an attribution linking an item to a source."""
+        key = f"{attribution.item_id}:{attribution.source_id}"
+        self._attributions[key] = attribution
+        self._save()
+
+    def get_attributions(self, item_id: str) -> list[ItemAttribution]:
+        """Get all attributions for an item."""
+        result = [a for a in self._attributions.values() if a.item_id == item_id]
+        return sorted(result, key=lambda a: a.discovered_at)
+
+    def get_attribution(self, item_id: str, source_id: str) -> ItemAttribution | None:
+        """Get a specific attribution for an item from a source."""
+        key = f"{item_id}:{source_id}"
+        return self._attributions.get(key)
+
+    def get_items_by_source_attribution(self, source_id: str, limit: int = 50) -> list[Item]:
+        """Get items attributed to a source (even if not the primary source)."""
+        item_ids = [a.item_id for a in self._attributions.values() if a.source_id == source_id]
+        items = [self._items[id] for id in item_ids if id in self._items]
+        # Sort by rank (nulls last) then discovered_at
+        items_with_attr = [(item, self._attributions.get(f"{item.id}:{source_id}")) for item in items]
+        items_with_attr.sort(key=lambda x: (x[1].rank if x[1] and x[1].rank is not None else 999999, x[1].discovered_at if x[1] else datetime.min))
+        return [item for item, _ in items_with_attr[:limit]]
 
     # Lifecycle
 

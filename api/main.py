@@ -45,6 +45,14 @@ class AddSourceRequest(BaseModel):
     url: str
 
 
+class AttributionResponse(BaseModel):
+    source_id: str
+    source_name: str
+    discovered_at: datetime
+    rank: int | None
+    context: str | None
+
+
 class ItemResponse(BaseModel):
     id: str
     source_id: str
@@ -57,6 +65,8 @@ class ItemResponse(BaseModel):
     seen: bool
     hidden: bool
     metadata: dict[str, Any]
+    canonical_ids: dict[str, str] = {}
+    attributions: list[AttributionResponse] = []
     score: float | None = None  # ML ranking score (click_prob * expected_reward)
 
 
@@ -600,6 +610,20 @@ def get_feed(
     item_responses = []
     for item in ranked:
         score = state.pipeline.score(item)
+
+        # Get attributions
+        attributions = state.store.get_attributions(item.id)
+        attr_responses = [
+            AttributionResponse(
+                source_id=attr.source_id,
+                source_name=sources_map.get(attr.source_id, type("", (), {"display_name": "Unknown"})).display_name,
+                discovered_at=attr.discovered_at,
+                rank=attr.rank,
+                context=attr.context,
+            )
+            for attr in attributions
+        ]
+
         item_responses.append(ItemResponse(
             id=item.id,
             source_id=item.source_id,
@@ -612,6 +636,8 @@ def get_feed(
             seen=item.seen,
             hidden=item.hidden,
             metadata=item.metadata,
+            canonical_ids=item.canonical_ids,
+            attributions=attr_responses,
             score=round(score, 3),
         ))
 
@@ -632,6 +658,19 @@ def get_item(item_id: str):
     sources_map = {s.id: s for s in state.store.list_sources()}
     source = sources_map.get(item.source_id)
 
+    # Get attributions
+    attributions = state.store.get_attributions(item.id)
+    attr_responses = [
+        AttributionResponse(
+            source_id=attr.source_id,
+            source_name=sources_map.get(attr.source_id, type("", (), {"display_name": "Unknown"})).display_name,
+            discovered_at=attr.discovered_at,
+            rank=attr.rank,
+            context=attr.context,
+        )
+        for attr in attributions
+    ]
+
     return ItemResponse(
         id=item.id,
         source_id=item.source_id,
@@ -644,6 +683,8 @@ def get_item(item_id: str):
         seen=item.seen,
         hidden=item.hidden,
         metadata=item.metadata,
+        canonical_ids=item.canonical_ids,
+        attributions=attr_responses,
     )
 
 
@@ -678,6 +719,67 @@ def hide_item(item_id: str):
 
     state.store.mark_hidden(item_id, hidden=True)
     return {"status": "hidden"}
+
+
+@app.get("/api/items/{item_id}/attributions", response_model=list[AttributionResponse])
+def get_item_attributions(item_id: str):
+    """Get all attributions for an item (which sources recommended it)."""
+    item = state.store.get_item(item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    sources_map = {s.id: s for s in state.store.list_sources()}
+    attributions = state.store.get_attributions(item_id)
+
+    return [
+        AttributionResponse(
+            source_id=attr.source_id,
+            source_name=sources_map.get(attr.source_id, type("", (), {"display_name": "Unknown"})).display_name,
+            discovered_at=attr.discovered_at,
+            rank=attr.rank,
+            context=attr.context,
+        )
+        for attr in attributions
+    ]
+
+
+class AddAttributionRequest(BaseModel):
+    source_id: str
+    rank: int | None = None
+    context: str | None = None
+
+
+@app.post("/api/items/{item_id}/attributions", response_model=AttributionResponse)
+def add_item_attribution(item_id: str, request: AddAttributionRequest):
+    """Add an attribution to an item (record that a source recommended it)."""
+    from omnifeed.models import ItemAttribution
+
+    item = state.store.get_item(item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    source = state.store.get_source(request.source_id)
+    if not source:
+        raise HTTPException(status_code=404, detail="Source not found")
+
+    attribution = ItemAttribution(
+        id=uuid.uuid4().hex[:12],
+        item_id=item_id,
+        source_id=request.source_id,
+        discovered_at=datetime.utcnow(),
+        rank=request.rank,
+        context=request.context,
+    )
+
+    state.store.add_attribution(attribution)
+
+    return AttributionResponse(
+        source_id=attribution.source_id,
+        source_name=source.display_name,
+        discovered_at=attribution.discovered_at,
+        rank=attribution.rank,
+        context=attribution.context,
+    )
 
 
 # =============================================================================

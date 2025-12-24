@@ -9,6 +9,7 @@ from pathlib import Path
 from omnifeed.models import (
     Source, SourceInfo, SourceStatus, Item, ContentType, ConsumptionType,
     FeedbackEvent, FeedbackDimension, FeedbackOption, ExplicitFeedback,
+    ItemAttribution,
 )
 from omnifeed.store.base import Store
 
@@ -39,6 +40,7 @@ CREATE TABLE IF NOT EXISTS items (
     content_type TEXT NOT NULL,
     consumption_type TEXT DEFAULT 'one_shot',
     metadata JSON,
+    canonical_ids JSON,
     seen INTEGER DEFAULT 0,
     hidden INTEGER DEFAULT 0,
     series_id TEXT,
@@ -99,6 +101,20 @@ CREATE TABLE IF NOT EXISTS explicit_feedback (
 
 CREATE INDEX IF NOT EXISTS idx_explicit_feedback_item ON explicit_feedback(item_id);
 CREATE INDEX IF NOT EXISTS idx_explicit_feedback_timestamp ON explicit_feedback(timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS item_attributions (
+    id TEXT PRIMARY KEY,
+    item_id TEXT NOT NULL REFERENCES items(id),
+    source_id TEXT NOT NULL REFERENCES sources(id),
+    discovered_at TEXT NOT NULL,
+    rank INTEGER,
+    context TEXT,
+    metadata JSON,
+    UNIQUE(item_id, source_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_attributions_item ON item_attributions(item_id);
+CREATE INDEX IF NOT EXISTS idx_attributions_source ON item_attributions(source_id);
 """
 
 
@@ -144,6 +160,15 @@ def _row_to_item(row: sqlite3.Row) -> Item:
         # Column might not exist in older DBs
         pass
 
+    # Handle canonical_ids
+    canonical_ids = {}
+    try:
+        if row["canonical_ids"]:
+            canonical_ids = json.loads(row["canonical_ids"])
+    except (KeyError, IndexError):
+        # Column might not exist in older DBs
+        pass
+
     return Item(
         id=row["id"],
         source_id=row["source_id"],
@@ -156,6 +181,7 @@ def _row_to_item(row: sqlite3.Row) -> Item:
         content_type=ContentType(row["content_type"]),
         consumption_type=ConsumptionType(row["consumption_type"]),
         metadata=json.loads(row["metadata"]) if row["metadata"] else {},
+        canonical_ids=canonical_ids,
         seen=bool(row["seen"]),
         hidden=bool(row["hidden"]),
         series_id=row["series_id"],
@@ -189,6 +215,11 @@ class SQLiteStore(Store):
         # Add embeddings column if missing
         if "embeddings" not in columns:
             self._conn.execute("ALTER TABLE items ADD COLUMN embeddings JSON")
+            self._conn.commit()
+
+        # Add canonical_ids column if missing
+        if "canonical_ids" not in columns:
+            self._conn.execute("ALTER TABLE items ADD COLUMN canonical_ids JSON")
             self._conn.commit()
 
         # Migrate legacy embedding to embeddings list
@@ -284,9 +315,9 @@ class SQLiteStore(Store):
             INSERT INTO items (
                 id, source_id, external_id, url, title, creator_name,
                 published_at, ingested_at, content_type, consumption_type,
-                metadata, seen, hidden, series_id, series_position, embeddings
+                metadata, canonical_ids, seen, hidden, series_id, series_position, embeddings
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(source_id, external_id) DO UPDATE SET
                 url = excluded.url,
                 title = excluded.title,
@@ -295,6 +326,7 @@ class SQLiteStore(Store):
                 content_type = excluded.content_type,
                 consumption_type = excluded.consumption_type,
                 metadata = excluded.metadata,
+                canonical_ids = excluded.canonical_ids,
                 series_id = excluded.series_id,
                 series_position = excluded.series_position,
                 embeddings = excluded.embeddings
@@ -311,6 +343,7 @@ class SQLiteStore(Store):
                 item.content_type.value,
                 item.consumption_type.value,
                 json.dumps(item.metadata),
+                json.dumps(item.canonical_ids) if item.canonical_ids else None,
                 int(item.seen),
                 int(item.hidden),
                 item.series_id,
@@ -684,6 +717,110 @@ class SQLiteStore(Store):
             completion_pct=row["completion_pct"],
             is_checkpoint=bool(row["is_checkpoint"]),
         )
+
+    # Canonical ID lookup for deduplication
+
+    def get_item_by_canonical_id(self, id_type: str, id_value: str) -> Item | None:
+        """Find an item by canonical ID (ISBN, IMDB, etc.)."""
+        # Use JSON query to search within canonical_ids
+        cursor = self._conn.execute(
+            """
+            SELECT * FROM items
+            WHERE json_extract(canonical_ids, ?) = ?
+            """,
+            (f"$.{id_type}", id_value),
+        )
+        row = cursor.fetchone()
+        return _row_to_item(row) if row else None
+
+    def find_items_by_canonical_ids(self, canonical_ids: dict[str, str]) -> Item | None:
+        """Find an existing item that matches any of the provided canonical IDs.
+
+        Returns the first matching item, or None if no match found.
+        Useful for deduplication when ingesting items from multiple sources.
+        """
+        for id_type, id_value in canonical_ids.items():
+            item = self.get_item_by_canonical_id(id_type, id_value)
+            if item:
+                return item
+        return None
+
+    # Item attributions
+
+    def add_attribution(self, attribution: ItemAttribution) -> None:
+        """Add an attribution linking an item to a source."""
+        self._conn.execute(
+            """
+            INSERT INTO item_attributions (id, item_id, source_id, discovered_at, rank, context, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(item_id, source_id) DO UPDATE SET
+                rank = excluded.rank,
+                context = excluded.context,
+                metadata = excluded.metadata
+            """,
+            (
+                attribution.id,
+                attribution.item_id,
+                attribution.source_id,
+                _datetime_to_str(attribution.discovered_at),
+                attribution.rank,
+                attribution.context,
+                json.dumps(attribution.metadata) if attribution.metadata else None,
+            ),
+        )
+        self._conn.commit()
+
+    def get_attributions(self, item_id: str) -> list[ItemAttribution]:
+        """Get all attributions for an item."""
+        cursor = self._conn.execute(
+            "SELECT * FROM item_attributions WHERE item_id = ? ORDER BY discovered_at",
+            (item_id,),
+        )
+        return [
+            ItemAttribution(
+                id=row["id"],
+                item_id=row["item_id"],
+                source_id=row["source_id"],
+                discovered_at=_str_to_datetime(row["discovered_at"]),
+                rank=row["rank"],
+                context=row["context"],
+                metadata=json.loads(row["metadata"]) if row["metadata"] else {},
+            )
+            for row in cursor.fetchall()
+        ]
+
+    def get_attribution(self, item_id: str, source_id: str) -> ItemAttribution | None:
+        """Get a specific attribution for an item from a source."""
+        cursor = self._conn.execute(
+            "SELECT * FROM item_attributions WHERE item_id = ? AND source_id = ?",
+            (item_id, source_id),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return ItemAttribution(
+            id=row["id"],
+            item_id=row["item_id"],
+            source_id=row["source_id"],
+            discovered_at=_str_to_datetime(row["discovered_at"]),
+            rank=row["rank"],
+            context=row["context"],
+            metadata=json.loads(row["metadata"]) if row["metadata"] else {},
+        )
+
+    def get_items_by_source_attribution(self, source_id: str, limit: int = 50) -> list[Item]:
+        """Get items attributed to a source (even if not the primary source)."""
+        cursor = self._conn.execute(
+            """
+            SELECT i.* FROM items i
+            JOIN item_attributions a ON i.id = a.item_id
+            WHERE a.source_id = ?
+            ORDER BY a.rank ASC NULLS LAST, a.discovered_at DESC
+            LIMIT ?
+            """,
+            (source_id, limit),
+        )
+        return [_row_to_item(row) for row in cursor.fetchall()]
 
     # Lifecycle
 
