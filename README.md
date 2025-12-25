@@ -6,6 +6,7 @@ A unified content feed aggregator with personalized ML-powered ranking. Aggregat
 
 - **Multi-source aggregation**: YouTube channels/playlists, RSS/Atom feeds, Bandcamp artists/labels/fans, Qobuz artists/labels, TikTok (via RSSHub), sitemaps
 - **ML-powered ranking**: Learn from your engagement to surface content you'll enjoy
+- **Multi-objective ranking**: Filter feed by goal (entertainment, curiosity, learning, expertise)
 - **Smart discovery**: LLM-powered source recommendations based on your interests
 - **Inline rendering**: Watch YouTube, view articles, and browse content without leaving the app
 - **Explicit feedback**: Rate content on multiple dimensions (entertainment, curiosity, foundational knowledge, etc.)
@@ -93,7 +94,10 @@ cd web && npm run dev
 
 - **All Items**: Shows ranked feed from all sources
 - **Source filter**: Click a source in sidebar to view only its content
+- **Objective filter**: Select an objective (entertainment, curiosity, etc.) to re-rank the feed
 - **Show read**: Toggle to include already-seen items
+- **Sources**: Manage sources (poll, delete, view status)
+- **Stats**: View engagement statistics and train models
 - **Refresh**: Polls the current source (or all sources) for new content
 
 ### Reading & Rating
@@ -107,12 +111,16 @@ cd web && npm run dev
    - Foundational Knowledge
    - Targeted Expertise
 
-### Training the Model
+### Training Models
 
 After providing feedback on 10+ items:
 1. Go to **Stats** (top right)
-2. Click **"Train Model"**
-3. Future rankings will incorporate your preferences
+2. View all models and their training status
+3. Click **"Train"** on individual models or **"Train All"**
+
+Two models are available:
+- **Default**: General ranking based on click and reward prediction
+- **Multi-Objective**: Separate reward heads for each objective type (requires selecting reward types during feedback)
 
 ## Discovery (LLM-Powered)
 

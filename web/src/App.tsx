@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from 'react';
-import { Sidebar, FeedList, AddSourceModal, ReaderPane, StatsView } from './components';
+import { Sidebar, FeedList, AddSourceModal, ReaderPane, StatsView, SourcesView } from './components';
 import type { ReadingFeedback } from './components';
 import type { FeedItem } from './api/types';
 import { markSeen, recordFeedback, pollSource, pollAllSources, getObjectives } from './api/client';
@@ -10,6 +10,7 @@ function App() {
   const [showAddModal, setShowAddModal] = useState(false);
   const [showSeen, setShowSeen] = useState(false);
   const [showStats, setShowStats] = useState(false);
+  const [showSources, setShowSources] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
   const [readingItem, setReadingItem] = useState<FeedItem | null>(null);
   const [polling, setPolling] = useState(false);
@@ -120,6 +121,13 @@ function App() {
             </label>
 
             <button
+              onClick={() => setShowSources(true)}
+              className="px-3 py-1.5 text-sm bg-neutral-800 hover:bg-neutral-700 rounded transition-colors"
+            >
+              Sources
+            </button>
+
+            <button
               onClick={() => setShowStats(true)}
               className="px-3 py-1.5 text-sm bg-neutral-800 hover:bg-neutral-700 rounded transition-colors"
             >
@@ -168,6 +176,11 @@ function App() {
       {/* Stats view */}
       {showStats && (
         <StatsView onClose={() => setShowStats(false)} sourceId={selectedSource} />
+      )}
+
+      {/* Sources view */}
+      {showSources && (
+        <SourcesView onClose={() => setShowSources(false)} onRefresh={handleRefresh} />
       )}
     </div>
   );

@@ -223,3 +223,25 @@ export interface LLMStatus {
     anthropic: { available: boolean; model: string };
   };
 }
+
+// Sitemap config
+
+export interface SitemapSelectors {
+  title: string | null;
+  description: string | null;
+  image: string | null;
+  author: string | null;
+}
+
+export interface SitemapConfig {
+  domain: string;
+  selectors: SitemapSelectors;
+  fetch_content: boolean;
+  max_items: number;
+}
+
+export interface SitemapConfigPayload {
+  selectors?: Partial<SitemapSelectors>;
+  fetch_content?: boolean;
+  max_items?: number;
+}

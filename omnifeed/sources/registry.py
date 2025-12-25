@@ -102,8 +102,8 @@ def create_registry() -> PluginRegistry:
     registry = PluginRegistry()
 
     # Discover and register plugins in a sensible order
-    # (YouTube before RSS, etc.)
-    priority_order = ["youtube", "bandcamp", "qobuz", "rss"]
+    # (YouTube before RSS, sitemap before RSS, etc.)
+    priority_order = ["youtube", "bandcamp", "qobuz", "sitemap", "rss"]
 
     plugins_by_type: dict[str, list[SourcePlugin]] = {}
     for plugin in discover_plugins():

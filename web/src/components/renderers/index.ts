@@ -53,7 +53,8 @@ const renderers: RendererInfo[] = [
     id: 'text',
     name: 'Plain Text',
     component: TextRenderer,
-    canHandle: (item) => !!item.metadata.content_text,
+    // Skip if needs_content_fetch - means we only have a snippet, not full text
+    canHandle: (item) => !!item.metadata.content_text && !item.metadata.needs_content_fetch,
     priority: 5,
   },
   {

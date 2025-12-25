@@ -257,3 +257,29 @@ export async function getInterestProfile(): Promise<import('./types').InterestPr
 export async function getLLMStatus(): Promise<import('./types').LLMStatus> {
   return fetchJson(`${API_BASE}/discover/llm-status`);
 }
+
+// Sitemap Config
+
+export async function getSitemapConfigs(): Promise<import('./types').SitemapConfig[]> {
+  return fetchJson(`${API_BASE}/sitemap/configs`);
+}
+
+export async function getSitemapConfig(domain: string): Promise<import('./types').SitemapConfig> {
+  return fetchJson(`${API_BASE}/sitemap/configs/${encodeURIComponent(domain)}`);
+}
+
+export async function upsertSitemapConfig(
+  domain: string,
+  config: import('./types').SitemapConfigPayload
+): Promise<import('./types').SitemapConfig> {
+  return fetchJson(`${API_BASE}/sitemap/configs/${encodeURIComponent(domain)}`, {
+    method: 'POST',
+    body: JSON.stringify(config),
+  });
+}
+
+export async function deleteSitemapConfig(domain: string): Promise<void> {
+  await fetchJson(`${API_BASE}/sitemap/configs/${encodeURIComponent(domain)}`, {
+    method: 'DELETE',
+  });
+}

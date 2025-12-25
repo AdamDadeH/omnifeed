@@ -1,8 +1,31 @@
 # Ranking Model
 
-OmniFeed uses a multi-head ML model to rank content based on predicted engagement and reward.
+OmniFeed uses ML models to rank content based on predicted engagement and reward. Two model types are available:
 
-## Overview
+1. **Default Model** - Single reward predictor
+2. **Multi-Objective Model** - Per-objective reward heads
+
+## Model Registry
+
+Models are managed via a registry that supports multiple model types:
+
+```python
+from omnifeed.ranking.registry import get_model_registry
+
+registry = get_model_registry()
+
+# List available models
+for name, model in registry.models.items():
+    print(f"{name}: trained={model.is_trained}")
+
+# Train a specific model
+result = registry.train("multi_objective", store)
+
+# Get model status
+status = registry.get_status()
+```
+
+## Default Model Overview
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -27,6 +50,69 @@ OmniFeed uses a multi-head ML model to rank content based on predicted engagemen
               └───────────────┬───────────────┘
                               ▼
                     Final Score = P(click) × E[reward]
+```
+
+## Multi-Objective Model
+
+The multi-objective model trains separate reward heads for different content objectives:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    EmbeddingFusionLayer                      │
+│              (PCA to 128 dims per embedding type)           │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+                       StandardScaler
+                              │
+              ┌───────┬───────┼───────┬───────┐
+              ▼       ▼       ▼       ▼       ▼
+           Ridge   Ridge   Ridge   Ridge   LogReg
+        Entertainment Curiosity Foundational Targeted  P(click)
+           [0-5]    [0-5]    [0-5]    [0-5]    [0-1]
+```
+
+### Objectives
+
+| Objective | Description |
+|-----------|-------------|
+| Entertainment | Pure enjoyment or fun |
+| Curiosity | Satisfied intellectual curiosity |
+| Foundational | Core knowledge or skills |
+| Targeted | Specific expertise needed |
+
+### Usage
+
+```python
+from omnifeed.ranking.multi_objective import get_multi_objective_model
+
+model = get_multi_objective_model()
+
+# Predict all objectives
+rewards = model.predict(item)
+# {'entertainment': 3.2, 'curiosity': 4.1, 'foundational': 2.0, 'targeted': 1.5}
+
+# Score for specific objective
+score = model.score(item, objective="curiosity")
+```
+
+### API
+
+```bash
+# Get available objectives with training counts
+curl http://localhost:8000/api/model/objectives
+
+# Response:
+{
+  "objectives": [
+    {"id": "entertainment", "label": "Entertainment", "training_count": 30},
+    {"id": "curiosity", "label": "Curiosity", "training_count": 9},
+    ...
+  ]
+}
+
+# Train multi-objective model
+curl -X POST http://localhost:8000/api/model/train?model=multi_objective
 ```
 
 ## Installation
@@ -163,11 +249,40 @@ if result["status"] == "success":
 ### API Trigger
 
 ```bash
-# Train the model
-curl -X POST http://localhost:8000/api/model/train
+# Train all models
+curl -X POST http://localhost:8000/api/model/train?model=all
 
-# Check status
+# Train specific model
+curl -X POST http://localhost:8000/api/model/train?model=default
+curl -X POST http://localhost:8000/api/model/train?model=multi_objective
+
+# Check status of all models
 curl http://localhost:8000/api/model/status
+
+# Response:
+{
+  "models": {
+    "default": {
+      "is_trained": true,
+      "model_exists": true,
+      "supports_objectives": false,
+      "is_default": true,
+      "source_count": 5
+    },
+    "multi_objective": {
+      "is_trained": true,
+      "model_exists": true,
+      "supports_objectives": true,
+      "is_default": false,
+      "objective_counts": {
+        "entertainment": 30,
+        "curiosity": 9,
+        "foundational": 8,
+        "targeted": 0
+      }
+    }
+  }
+}
 ```
 
 ### Minimum Data

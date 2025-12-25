@@ -480,14 +480,14 @@ def poll_all_sources():
 
 
 @app.delete("/api/sources/{source_id}")
-def disable_source(source_id: str):
-    """Disable a source."""
+def delete_source(source_id: str, keep_items: bool = Query(False, description="Keep items when deleting source")):
+    """Delete a source and its items."""
     source = state.store.get_source(source_id)
     if not source:
         raise HTTPException(status_code=404, detail="Source not found")
 
-    state.store.disable_source(source_id)
-    return {"status": "disabled"}
+    items_deleted = state.store.delete_source(source_id, delete_items=not keep_items)
+    return {"status": "deleted", "items_deleted": items_deleted}
 
 
 # =============================================================================
@@ -1480,6 +1480,125 @@ def get_llm_status():
     from omnifeed.discovery import get_llm_status as _get_status
 
     return _get_status()
+
+
+# =============================================================================
+# Routes: Sitemap Config
+# =============================================================================
+
+
+class SitemapSelectorsRequest(BaseModel):
+    title: str | None = "og:title"
+    description: str | None = "og:description"
+    image: str | None = "og:image"
+    author: str | None = None
+
+
+class SitemapConfigRequest(BaseModel):
+    selectors: SitemapSelectorsRequest = SitemapSelectorsRequest()
+    fetch_content: bool = True
+    max_items: int = 1000
+
+
+class SitemapConfigResponse(BaseModel):
+    domain: str
+    selectors: dict[str, str | None]
+    fetch_content: bool
+    max_items: int
+
+
+@app.get("/api/sitemap/configs", response_model=list[SitemapConfigResponse])
+def list_sitemap_configs():
+    """List all sitemap configs."""
+    from pathlib import Path
+    import json
+
+    config_dir = Path("~/.omnifeed/sitemap_configs").expanduser()
+    if not config_dir.exists():
+        return []
+
+    configs = []
+    for config_file in config_dir.glob("*.json"):
+        try:
+            with open(config_file) as f:
+                data = json.load(f)
+            configs.append(SitemapConfigResponse(
+                domain=config_file.stem,
+                selectors=data.get("selectors", {}),
+                fetch_content=data.get("fetch_content", True),
+                max_items=data.get("max_items", 1000),
+            ))
+        except Exception:
+            pass  # Skip invalid configs
+
+    return configs
+
+
+@app.get("/api/sitemap/configs/{domain}", response_model=SitemapConfigResponse)
+def get_sitemap_config(domain: str):
+    """Get sitemap config for a domain."""
+    from pathlib import Path
+    import json
+
+    config_path = Path("~/.omnifeed/sitemap_configs").expanduser() / f"{domain}.json"
+    if not config_path.exists():
+        raise HTTPException(status_code=404, detail="Config not found")
+
+    with open(config_path) as f:
+        data = json.load(f)
+
+    return SitemapConfigResponse(
+        domain=domain,
+        selectors=data.get("selectors", {}),
+        fetch_content=data.get("fetch_content", True),
+        max_items=data.get("max_items", 1000),
+    )
+
+
+@app.post("/api/sitemap/configs/{domain}", response_model=SitemapConfigResponse)
+def upsert_sitemap_config(domain: str, request: SitemapConfigRequest):
+    """Create or update sitemap config for a domain."""
+    from pathlib import Path
+    import json
+
+    config_dir = Path("~/.omnifeed/sitemap_configs").expanduser()
+    config_dir.mkdir(parents=True, exist_ok=True)
+
+    config_path = config_dir / f"{domain}.json"
+
+    data = {
+        "selectors": {
+            "title": request.selectors.title,
+            "description": request.selectors.description,
+            "image": request.selectors.image,
+            "author": request.selectors.author,
+        },
+        "fetch_content": request.fetch_content,
+        "max_items": request.max_items,
+    }
+
+    with open(config_path, "w") as f:
+        json.dump(data, f, indent=4)
+
+    return SitemapConfigResponse(
+        domain=domain,
+        selectors=data["selectors"],
+        fetch_content=data["fetch_content"],
+        max_items=data["max_items"],
+    )
+
+
+@app.delete("/api/sitemap/configs/{domain}")
+def delete_sitemap_config(domain: str):
+    """Delete sitemap config for a domain."""
+    from pathlib import Path
+
+    config_path = Path("~/.omnifeed/sitemap_configs").expanduser() / f"{domain}.json"
+    if not config_path.exists():
+        raise HTTPException(status_code=404, detail="Config not found")
+
+    config_path.unlink()
+    return {"status": "deleted"}
 
 
 # =============================================================================

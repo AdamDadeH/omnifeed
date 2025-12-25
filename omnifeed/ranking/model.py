@@ -482,8 +482,12 @@ class RankingModel:
 
         return float(click_prob), expected_reward
 
-    def score(self, item: Item) -> float:
+    def score(self, item: Item, objective: str | None = None) -> float:
         """Compute a single ranking score for an item.
+
+        Args:
+            item: The item to score
+            objective: Ignored by this model (for interface compatibility)
 
         When click model exists: score = click_prob * expected_reward
         Otherwise: score = expected_reward (use reward directly)

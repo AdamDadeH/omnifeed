@@ -306,6 +306,21 @@ class SQLiteStore(Store):
         )
         self._conn.commit()
 
+    def delete_source(self, source_id: str, delete_items: bool = True) -> int:
+        """Permanently delete a source and optionally its items.
+
+        Returns the number of items deleted.
+        """
+        items_deleted = 0
+        if delete_items:
+            cursor = self._conn.execute(
+                "DELETE FROM items WHERE source_id = ?", (source_id,)
+            )
+            items_deleted = cursor.rowcount
+        self._conn.execute("DELETE FROM sources WHERE id = ?", (source_id,))
+        self._conn.commit()
+        return items_deleted
+
     # Items
 
     def upsert_item(self, item: Item) -> None:

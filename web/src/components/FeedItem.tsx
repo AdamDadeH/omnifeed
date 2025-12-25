@@ -34,6 +34,13 @@ export function FeedItem({ item, onOpen, onMarkSeen, onHide }: Props) {
             <div className="flex items-center gap-2 mt-1 text-sm text-neutral-500">
               <span className="truncate max-w-[200px]">{item.source_name}</span>
               <span>·</span>
+              <a
+                href={item.url}
+                className="text-blue-400 hover:underline"
+              >
+                link
+              </a>
+              <span>·</span>
               <span>{formatDistanceToNow(item.published_at)}</span>
               {item.content_type !== 'article' && (
                 <>

@@ -129,10 +129,16 @@ flowchart TB
         SOURCE_RET[SourceRetriever]
     end
 
-    subgraph Model["Model (omnifeed/ranking/model.py)"]
+    subgraph Registry["Model Registry"]
+        MODEL_REG[ModelRegistry]
+        DEFAULT[Default RankingModel]
+        MULTI_OBJ[MultiObjectiveModel]
+    end
+
+    subgraph Model["Models (omnifeed/ranking/)"]
         RANK_MODEL[RankingModel]
-        FEATURES[Feature Extraction]
-        TRAIN[Training]
+        MULTI_MODEL[MultiObjectiveModel]
+        FUSION[EmbeddingFusionLayer]
     end
 
     subgraph Embeddings["Embeddings"]
@@ -144,13 +150,27 @@ flowchart TB
     RETRIEVER --> ALL_RET
     RETRIEVER --> SOURCE_RET
 
-    RANK_PIPE --> RANK_MODEL
-    RANK_MODEL --> FEATURES
-    RANK_MODEL --> TRAIN
+    RANK_PIPE --> MODEL_REG
+    MODEL_REG --> DEFAULT
+    MODEL_REG --> MULTI_OBJ
+
+    DEFAULT --> RANK_MODEL
+    MULTI_OBJ --> MULTI_MODEL
+    MULTI_MODEL --> FUSION
 
     RANK_PIPE --> EMB_SVC
     EMB_SVC --> TRANSCRIPT
 ```
+
+### Multi-Objective Ranking
+
+The multi-objective model trains separate reward heads for different content objectives:
+- **Entertainment** - Pure enjoyment
+- **Curiosity** - Intellectual satisfaction
+- **Foundational** - Core knowledge/skills
+- **Targeted** - Specific expertise
+
+Users can filter the feed by objective to surface content matching their current goal.
 
 ## Discovery System
 
@@ -193,6 +213,7 @@ flowchart LR
     subgraph Sources
         GET_SRC[GET /sources]
         POST_SRC[POST /sources]
+        DEL_SRC[DELETE /sources/id]
         POLL[POST /sources/id/poll]
     end
 
@@ -206,6 +227,7 @@ flowchart LR
     subgraph Feedback
         POST_FB[POST /feedback]
         POST_EXPLICIT[POST /feedback/explicit]
+        GET_STATS[GET /feedback/stats]
     end
 
     subgraph Discovery
@@ -220,6 +242,14 @@ flowchart LR
     subgraph Model
         TRAIN[POST /model/train]
         STATUS[GET /model/status]
+        OBJECTIVES[GET /model/objectives]
+    end
+
+    subgraph SitemapConfig
+        LIST_CFG[GET /sitemap/configs]
+        GET_CFG[GET /sitemap/configs/domain]
+        POST_CFG[POST /sitemap/configs/domain]
+        DEL_CFG[DELETE /sitemap/configs/domain]
     end
 ```
 
@@ -241,13 +271,15 @@ omnifeed/
 │   ├── bandcamp/       # Bandcamp adapter + search
 │   ├── qobuz/          # Qobuz adapter + search
 │   ├── rss/            # RSS adapter + Feedly search
-│   ├── sitemap/        # Sitemap adapter
+│   ├── sitemap/        # Sitemap adapter (config-driven extraction)
 │   └── tiktok/         # TikTok adapter
 ├── adapters/
 │   └── __init__.py     # Compatibility shim → sources/
 ├── ranking/
 │   ├── pipeline.py     # Retrieval + scoring
-│   ├── model.py        # ML model
+│   ├── model.py        # Default ML model
+│   ├── multi_objective.py  # Multi-objective model
+│   ├── registry.py     # Model registry
 │   └── embeddings.py   # Text embeddings
 ├── discovery/
 │   ├── llm.py          # Multi-backend LLM
@@ -261,5 +293,30 @@ api/
 └── main.py             # FastAPI routes
 
 web/
-└── src/                # React frontend
+└── src/
+    ├── components/
+    │   ├── FeedItem.tsx      # Feed item display
+    │   ├── FeedList.tsx      # Paginated feed
+    │   ├── ReaderPane.tsx    # Content reader with feedback
+    │   ├── Sidebar.tsx       # Source navigation
+    │   ├── StatsView.tsx     # Engagement stats + model training
+    │   ├── SourcesView.tsx   # Source management
+    │   └── renderers/        # Content type renderers
+    │       ├── HtmlRenderer.tsx
+    │       ├── TextRenderer.tsx
+    │       ├── YouTubeRenderer.tsx
+    │       ├── QobuzRenderer.tsx
+    │       ├── TikTokRenderer.tsx
+    │       └── WebPageRenderer.tsx  # iframe fallback
+    └── api/
+        ├── client.ts         # API client functions
+        └── types.ts          # TypeScript types
+
+~/.omnifeed/
+├── config.json           # User configuration
+├── omnifeed.db           # SQLite database
+├── ranking_model.pkl     # Default model
+├── multi_objective_model.pkl  # Multi-objective model
+└── sitemap_configs/      # Per-domain sitemap extraction configs
+    └── <domain>.json
 ```

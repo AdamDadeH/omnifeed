@@ -44,6 +44,11 @@ class Store(ABC):
         """Disable (soft delete) a source."""
         pass
 
+    @abstractmethod
+    def delete_source(self, source_id: str, delete_items: bool = True) -> int:
+        """Permanently delete a source and optionally its items."""
+        pass
+
     # Items
     @abstractmethod
     def upsert_item(self, item: Item) -> None:

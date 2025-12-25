@@ -290,17 +290,15 @@ export function ReaderPane({ item, onClose, onFeedback }: Props) {
             </span>
           )}
 
-          {/* Open external - only show if no inline renderer or as secondary option */}
-          {!hasInlineRenderer && (
-            <a
-              href={item.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="px-3 py-1.5 text-sm bg-blue-600 hover:bg-blue-500 rounded transition-colors"
-            >
-              Open original
-            </a>
-          )}
+          {/* Open external - always show, new tab since it leaves app */}
+          <a
+            href={item.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="px-3 py-1.5 text-sm text-blue-400 hover:underline"
+          >
+            Open original ↗
+          </a>
 
           {/* Back - close without recording anything */}
           <button
