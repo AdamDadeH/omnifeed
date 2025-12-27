@@ -1,0 +1,51 @@
+{
+  "manifest_version": 2,
+  "name": "OmniFeed Capture",
+  "version": "0.1.0",
+  "description": "Capture implicit feedback for OmniFeed recommendation system",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": [
+    "activeTab",
+    "storage",
+    "tabs",
+    "<all_urls>"
+  ],
+  "browser_action": {
+    "default_popup": "popup/index.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "background": {
+    "scripts": ["background/service-worker.js"],
+    "persistent": false
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.youtube.com/*",
+        "*://*.netflix.com/*",
+        "*://*.spotify.com/*",
+        "*://*.medium.com/*",
+        "*://*.substack.com/*"
+      ],
+      "js": ["content/main.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    "content/isolated.js"
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "omnifeed@example.com",
+      "strict_min_version": "91.0"
+    }
+  }
+}

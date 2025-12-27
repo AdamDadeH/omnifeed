@@ -1,0 +1,27 @@
+{
+  "name": "omnifeed-extension",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OmniFeed browser extension for implicit feedback capture",
+  "scripts": {
+    "dev:chrome": "node scripts/build.mjs --watch --browser chrome",
+    "dev:firefox": "node scripts/build.mjs --watch --browser firefox",
+    "build:chrome": "node scripts/build.mjs --browser chrome",
+    "build:firefox": "node scripts/build.mjs --browser firefox",
+    "build:all": "npm run build:chrome && npm run build:firefox",
+    "clean": "rm -rf dist/chrome dist/firefox",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.270",
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.7.0"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "webextension-polyfill": "^0.12.0"
+  }
+}
