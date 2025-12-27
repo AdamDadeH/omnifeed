@@ -309,3 +309,18 @@ export async function getCreatorItems(
 export async function getSourceStats(sourceId: string): Promise<import('./types').SourceStats> {
   return fetchJson(`${API_BASE}/sources/${sourceId}/stats`);
 }
+
+// Content Proxy
+
+export interface ProxiedContent {
+  url: string;
+  content_type: string;
+  html?: string;
+  text?: string;
+  title?: string;
+  error?: string;
+}
+
+export async function fetchProxiedContent(url: string): Promise<ProxiedContent> {
+  return fetchJson(`${API_BASE}/proxy/content?url=${encodeURIComponent(url)}`);
+}

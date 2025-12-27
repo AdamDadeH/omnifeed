@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from 'react';
-import { Sidebar, FeedList, AddSourceModal, ReaderPane, StatsView, SourcesView, CreatorsView } from './components';
+import { Sidebar, FeedList, AddSourceModal, ReaderPane, StatsView, SourcesView, CreatorsView, RatedView } from './components';
 import type { ReadingFeedback } from './components';
 import type { FeedItem } from './api/types';
 import { markSeen, recordFeedback, pollSource, pollAllSources, getObjectives } from './api/client';
@@ -12,6 +12,7 @@ function App() {
   const [showStats, setShowStats] = useState(false);
   const [showSources, setShowSources] = useState(false);
   const [showCreators, setShowCreators] = useState(false);
+  const [showRated, setShowRated] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
   const [readingItem, setReadingItem] = useState<FeedItem | null>(null);
   const [polling, setPolling] = useState(false);
@@ -111,6 +112,13 @@ function App() {
               </button>
 
               <button
+                onClick={() => setShowRated(true)}
+                className="px-3 py-1.5 text-sm bg-neutral-800 hover:bg-neutral-700 rounded transition-colors"
+              >
+                Rated
+              </button>
+
+              <button
                 onClick={() => setShowStats(true)}
                 className="px-3 py-1.5 text-sm bg-neutral-800 hover:bg-neutral-700 rounded transition-colors"
               >
@@ -201,6 +209,11 @@ function App() {
       {/* Creators view */}
       {showCreators && (
         <CreatorsView onClose={() => setShowCreators(false)} />
+      )}
+
+      {/* Rated items view */}
+      {showRated && (
+        <RatedView onClose={() => setShowRated(false)} onOpenItem={handleOpenItem} />
       )}
     </div>
   );

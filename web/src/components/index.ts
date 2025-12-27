@@ -6,4 +6,5 @@ export { ReaderPane } from './ReaderPane';
 export { StatsView } from './StatsView';
 export { SourcesView } from './SourcesView';
 export { CreatorsView } from './CreatorsView';
+export { RatedView } from './RatedView';
 export type { ReadingFeedback } from './ReaderPane';

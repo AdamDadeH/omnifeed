@@ -1,6 +1,7 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import type { RendererProps } from './types';
 import type { FeedItem } from '../../api/types';
+import { fetchProxiedContent } from '../../api/client';
 
 export function canHandleWebPage(item: FeedItem): boolean {
   // Handle sitemap items or items that need direct page loading
@@ -18,35 +19,109 @@ export function canHandleWebPage(item: FeedItem): boolean {
 export function WebPageRenderer({ item, onScrollProgress }: RendererProps) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [html, setHtml] = useState<string | null>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
 
-  const handleLoad = useCallback(() => {
-    setLoading(false);
-    // Mark as complete when page loads
-    onScrollProgress?.(100);
+  // Fetch content via proxy
+  useEffect(() => {
+    let cancelled = false;
+
+    async function fetchContent() {
+      try {
+        const result = await fetchProxiedContent(item.url);
+
+        if (cancelled) return;
+
+        if (result.error) {
+          setError(result.error);
+          setLoading(false);
+          return;
+        }
+
+        if (result.html) {
+          // Rewrite relative URLs to absolute URLs
+          const baseUrl = new URL(result.url);
+          let processedHtml = result.html;
+
+          // Rewrite src and href attributes to use absolute URLs
+          processedHtml = processedHtml.replace(
+            /(src|href)="(?!https?:\/\/|data:|#|javascript:)([^"]+)"/gi,
+            (match, attr, path) => {
+              try {
+                const absoluteUrl = new URL(path, baseUrl).href;
+                return `${attr}="${absoluteUrl}"`;
+              } catch {
+                return match;
+              }
+            }
+          );
+
+          // Also handle single-quoted attributes
+          processedHtml = processedHtml.replace(
+            /(src|href)='(?!https?:\/\/|data:|#|javascript:)([^']+)'/gi,
+            (match, attr, path) => {
+              try {
+                const absoluteUrl = new URL(path, baseUrl).href;
+                return `${attr}='${absoluteUrl}'`;
+              } catch {
+                return match;
+              }
+            }
+          );
+
+          setHtml(processedHtml);
+        } else if (result.text) {
+          // Wrap plain text in basic HTML
+          setHtml(`<pre style="white-space: pre-wrap; font-family: inherit;">${result.text}</pre>`);
+        } else {
+          setError('No content available');
+        }
+
+        setLoading(false);
+      } catch (err) {
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : 'Failed to load content');
+          setLoading(false);
+        }
+      }
+    }
+
+    fetchContent();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [item.url]);
+
+  // Handle scroll progress
+  const handleScroll = useCallback(() => {
+    if (!containerRef.current || !onScrollProgress) return;
+    const { scrollTop, scrollHeight, clientHeight } = containerRef.current;
+    const maxScroll = scrollHeight - clientHeight;
+    const pct = maxScroll > 0 ? (scrollTop / maxScroll) * 100 : 100;
+    onScrollProgress(pct);
   }, [onScrollProgress]);
 
-  const handleError = useCallback(() => {
-    setLoading(false);
-    setError('Page could not be loaded in frame. Some sites block embedding.');
-  }, []);
-
-  // Some sites block iframes - detect and show fallback
   useEffect(() => {
-    // Give iframe a chance to load, then check
-    const timeout = setTimeout(() => {
-      if (loading) {
-        // Still loading after 10s - might be blocked
-        setLoading(false);
-      }
-    }, 10000);
-    return () => clearTimeout(timeout);
-  }, [loading]);
+    const container = containerRef.current;
+    if (!container) return;
+    container.addEventListener('scroll', handleScroll);
+    return () => container.removeEventListener('scroll', handleScroll);
+  }, [handleScroll]);
+
+  // Report initial scroll on content load
+  useEffect(() => {
+    if (html && !loading) {
+      // Small delay to let content render
+      setTimeout(() => handleScroll(), 100);
+    }
+  }, [html, loading, handleScroll]);
 
   return (
     <div className="h-full flex flex-col">
       {/* Loading state */}
       {loading && (
-        <div className="absolute inset-0 flex items-center justify-center bg-neutral-950 z-10">
+        <div className="flex-1 flex items-center justify-center bg-neutral-950">
           <div className="text-center">
             <div className="w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full animate-spin mx-auto mb-3" />
             <p className="text-neutral-400 text-sm">Loading page...</p>
@@ -55,7 +130,7 @@ export function WebPageRenderer({ item, onScrollProgress }: RendererProps) {
       )}
 
       {/* Error state */}
-      {error && (
+      {error && !loading && (
         <div className="flex-1 flex items-center justify-center">
           <div className="text-center max-w-md px-6">
             <div className="w-12 h-12 rounded-full bg-neutral-800 flex items-center justify-center mx-auto mb-4">
@@ -79,17 +154,30 @@ export function WebPageRenderer({ item, onScrollProgress }: RendererProps) {
         </div>
       )}
 
-      {/* Iframe */}
-      {!error && (
-        <iframe
-          src={item.url}
-          title={item.title}
-          className="flex-1 w-full border-0"
-          onLoad={handleLoad}
-          onError={handleError}
-          sandbox="allow-same-origin allow-scripts allow-popups allow-forms"
-          referrerPolicy="no-referrer"
-        />
+      {/* Content via sandboxed iframe with srcdoc */}
+      {html && !loading && !error && (
+        <div ref={containerRef} className="flex-1 overflow-auto">
+          <iframe
+            srcDoc={html}
+            title={item.title}
+            className="w-full border-0"
+            style={{ minHeight: '100%', height: 'auto' }}
+            sandbox="allow-same-origin allow-popups"
+            onLoad={(e) => {
+              // Adjust iframe height to content
+              const iframe = e.target as HTMLIFrameElement;
+              try {
+                const doc = iframe.contentDocument || iframe.contentWindow?.document;
+                if (doc) {
+                  const height = doc.body.scrollHeight;
+                  iframe.style.height = `${height}px`;
+                }
+              } catch {
+                // Cross-origin content, can't access
+              }
+            }}
+          />
+        </div>
       )}
     </div>
   );

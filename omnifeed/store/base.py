@@ -7,6 +7,7 @@ from omnifeed.models import (
     Source, SourceInfo, Item, FeedbackEvent,
     FeedbackDimension, FeedbackOption, ExplicitFeedback,
     ItemAttribution, Creator, CreatorStats, SourceStats,
+    Platform, DiscoverySource, DiscoverySignal, PlatformInstance,
 )
 
 
@@ -253,6 +254,98 @@ class Store(ABC):
     @abstractmethod
     def upsert_attribution(self, attribution: ItemAttribution) -> None:
         """Add or update an attribution (upsert by item_id + source_id)."""
+        pass
+
+    # Platforms
+    @abstractmethod
+    def add_platform(self, platform: Platform) -> Platform:
+        """Add a new platform. Returns the created Platform."""
+        pass
+
+    @abstractmethod
+    def get_platform(self, platform_id: str) -> Platform | None:
+        """Get a platform by ID."""
+        pass
+
+    @abstractmethod
+    def get_platform_by_url(self, url: str) -> Platform | None:
+        """Find a platform that matches the given URL pattern."""
+        pass
+
+    @abstractmethod
+    def list_platforms(self) -> list[Platform]:
+        """List all platforms."""
+        pass
+
+    # Discovery sources
+    @abstractmethod
+    def add_discovery_source(self, source: DiscoverySource) -> DiscoverySource:
+        """Add a new discovery source. Returns the created DiscoverySource."""
+        pass
+
+    @abstractmethod
+    def get_discovery_source(self, source_id: str) -> DiscoverySource | None:
+        """Get a discovery source by ID."""
+        pass
+
+    @abstractmethod
+    def list_discovery_sources(self) -> list[DiscoverySource]:
+        """List all discovery sources."""
+        pass
+
+    @abstractmethod
+    def update_discovery_source_poll_time(
+        self, source_id: str, polled_at: datetime
+    ) -> None:
+        """Update the last polled timestamp for a discovery source."""
+        pass
+
+    # Discovery signals
+    @abstractmethod
+    def add_discovery_signal(self, signal: DiscoverySignal) -> DiscoverySignal:
+        """Add a discovery signal. Returns the created signal."""
+        pass
+
+    @abstractmethod
+    def get_discovery_signals(
+        self,
+        item_id: str | None = None,
+        source_id: str | None = None,
+        limit: int = 100,
+    ) -> list[DiscoverySignal]:
+        """Get discovery signals with optional filters."""
+        pass
+
+    @abstractmethod
+    def get_unresolved_signals(self, limit: int = 100) -> list[DiscoverySignal]:
+        """Get signals that haven't been matched to items yet."""
+        pass
+
+    @abstractmethod
+    def resolve_signal(self, signal_id: str, item_id: str) -> None:
+        """Link a discovery signal to a resolved item."""
+        pass
+
+    # Platform instances
+    @abstractmethod
+    def add_platform_instance(self, instance: PlatformInstance) -> PlatformInstance:
+        """Add a platform instance for content. Returns the created instance."""
+        pass
+
+    @abstractmethod
+    def get_platform_instances(
+        self,
+        item_id: str | None = None,
+        platform_id: str | None = None,
+    ) -> list[PlatformInstance]:
+        """Get platform instances with optional filters."""
+        pass
+
+    @abstractmethod
+    def get_platform_instance(
+        self, item_id: str, platform_id: str
+    ) -> PlatformInstance | None:
+        """Get a specific platform instance for an item on a platform."""
         pass
 
     # Lifecycle

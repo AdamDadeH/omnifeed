@@ -306,10 +306,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS for local development
+# CORS for local development and browser extension
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=["*"],  # Allow all origins for extension support
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -915,6 +915,77 @@ def get_feed(
     )
 
 
+class RatedItemResponse(BaseModel):
+    item: ItemResponse
+    rating: float
+    rated_at: datetime
+    selections: dict[str, list[str]] = {}
+
+
+class RatedItemsResponse(BaseModel):
+    items: list[RatedItemResponse]
+    total_count: int
+
+
+@app.get("/api/feed/rated", response_model=RatedItemsResponse)
+def get_rated_items(limit: int = 50, offset: int = 0):
+    """Get items that have explicit feedback (ratings)."""
+    import json
+    sources_map = {s.id: s for s in state.store.list_sources()}
+
+    # Query items with explicit feedback using explicit column names
+    cursor = state.store._conn.execute("""
+        SELECT
+            i.id, i.source_id, i.url, i.title, i.creator_id, i.creator_name,
+            i.published_at, i.content_type, i.seen, i.hidden, i.metadata, i.canonical_ids,
+            ef.reward_score, ef.timestamp as rated_at, ef.selections
+        FROM items i
+        JOIN explicit_feedback ef ON ef.item_id = i.id
+        ORDER BY ef.timestamp DESC
+        LIMIT ? OFFSET ?
+    """, (limit, offset))
+
+    rated_items = []
+    for row in cursor.fetchall():
+        (item_id, source_id, url, title, creator_id, creator_name,
+         published_at, content_type, seen, hidden, metadata_json, canonical_ids_json,
+         reward_score, rated_at, selections_json) = row
+
+        source = sources_map.get(source_id)
+        item_response = ItemResponse(
+            id=item_id,
+            source_id=source_id,
+            source_name=source.display_name if source else "Unknown",
+            url=url,
+            title=title,
+            creator_id=creator_id,
+            creator_name=creator_name,
+            published_at=published_at,
+            content_type=content_type,
+            seen=bool(seen),
+            hidden=bool(hidden),
+            metadata=json.loads(metadata_json) if metadata_json else {},
+            canonical_ids=json.loads(canonical_ids_json) if canonical_ids_json else {},
+        )
+
+        rated_items.append(RatedItemResponse(
+            item=item_response,
+            rating=reward_score,
+            rated_at=rated_at,
+            selections=json.loads(selections_json) if selections_json else {},
+        ))
+
+    # Get total count
+    cursor = state.store._conn.execute("""
+        SELECT COUNT(DISTINCT i.id)
+        FROM items i
+        JOIN explicit_feedback ef ON ef.item_id = i.id
+    """)
+    total = cursor.fetchone()[0]
+
+    return RatedItemsResponse(items=rated_items, total_count=total)
+
+
 @app.get("/api/items/{item_id}", response_model=ItemResponse)
 def get_item(item_id: str):
     """Get a single item."""
@@ -1048,6 +1119,123 @@ def add_item_attribution(item_id: str, request: AddAttributionRequest):
         rank=attribution.rank,
         context=attribution.context,
     )
+
+
+# =============================================================================
+# Routes: Content Proxy
+# =============================================================================
+
+
+class ContentProxyResponse(BaseModel):
+    url: str
+    content_type: str
+    html: str | None = None
+    text: str | None = None
+    title: str | None = None
+    error: str | None = None
+
+
+@app.get("/api/proxy/content", response_model=ContentProxyResponse)
+async def proxy_content(url: str = Query(..., description="URL to fetch")):
+    """Fetch external page content, bypassing CORS and X-Frame-Options restrictions.
+
+    This endpoint fetches the HTML content of a URL server-side and returns it,
+    allowing the frontend to render content that would otherwise be blocked.
+    """
+    import httpx
+    from html.parser import HTMLParser
+
+    class TitleExtractor(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.in_title = False
+            self.title = None
+
+        def handle_starttag(self, tag, attrs):
+            if tag.lower() == "title":
+                self.in_title = True
+
+        def handle_endtag(self, tag):
+            if tag.lower() == "title":
+                self.in_title = False
+
+        def handle_data(self, data):
+            if self.in_title:
+                self.title = data.strip()
+
+    # Basic URL validation
+    if not url.startswith(("http://", "https://")):
+        return ContentProxyResponse(
+            url=url,
+            content_type="error",
+            error="Invalid URL - must start with http:// or https://",
+        )
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+            response = await client.get(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.5",
+                },
+            )
+            response.raise_for_status()
+
+            content_type = response.headers.get("content-type", "").lower()
+
+            # Handle HTML
+            if "text/html" in content_type:
+                html = response.text
+
+                # Extract title
+                extractor = TitleExtractor()
+                try:
+                    extractor.feed(html)
+                except Exception:
+                    pass
+
+                return ContentProxyResponse(
+                    url=str(response.url),  # Use final URL after redirects
+                    content_type="text/html",
+                    html=html,
+                    title=extractor.title,
+                )
+
+            # Handle plain text
+            if "text/plain" in content_type:
+                return ContentProxyResponse(
+                    url=str(response.url),
+                    content_type="text/plain",
+                    text=response.text,
+                )
+
+            # Unsupported content type
+            return ContentProxyResponse(
+                url=str(response.url),
+                content_type=content_type,
+                error=f"Unsupported content type: {content_type}",
+            )
+
+    except httpx.TimeoutException:
+        return ContentProxyResponse(
+            url=url,
+            content_type="error",
+            error="Request timed out",
+        )
+    except httpx.HTTPStatusError as e:
+        return ContentProxyResponse(
+            url=url,
+            content_type="error",
+            error=f"HTTP {e.response.status_code}: {e.response.reason_phrase}",
+        )
+    except Exception as e:
+        return ContentProxyResponse(
+            url=url,
+            content_type="error",
+            error=str(e),
+        )
 
 
 # =============================================================================
@@ -1865,6 +2053,337 @@ def delete_sitemap_config(domain: str):
 
     config_path.unlink()
     return {"status": "deleted"}
+
+
+# =============================================================================
+# Routes: Extension API
+# =============================================================================
+
+
+class ExtensionAuthRequest(BaseModel):
+    client_version: str
+    platform: str | None = None
+
+
+class ExtensionAuthResponse(BaseModel):
+    authenticated: bool
+    session_id: str
+
+
+@app.post("/api/extension/auth", response_model=ExtensionAuthResponse)
+def extension_auth(request: ExtensionAuthRequest):
+    """Authenticate browser extension (currently always succeeds)."""
+    # For now, just return a session ID - no real auth
+    session_id = uuid.uuid4().hex
+    logger.info(f"Extension auth: version={request.client_version}, platform={request.platform}")
+    return ExtensionAuthResponse(
+        authenticated=True,
+        session_id=session_id,
+    )
+
+
+class ExtensionEventRequest(BaseModel):
+    # Accept both 'type' and 'event_type' from extension
+    type: str | None = None
+    event_type: str | None = None
+    timestamp: int
+    url: str
+    item_id: str | None = None
+    payload: dict[str, Any] = {}
+
+    @property
+    def event_type_value(self) -> str:
+        """Get the event type from either field."""
+        return self.type or self.event_type or "unknown"
+
+
+class ExtensionEventsRequest(BaseModel):
+    events: list[ExtensionEventRequest]
+    session_id: str | None = None  # Made optional for compatibility
+    client_version: str | None = None  # Made optional for compatibility
+
+
+class ExtensionEventsResponse(BaseModel):
+    received: int
+    processed: int
+
+
+@app.post("/api/extension/events", response_model=ExtensionEventsResponse)
+def submit_extension_events(request: ExtensionEventsRequest):
+    """Receive batch of events from browser extension.
+
+    Routes events to appropriate tables:
+    - Ratings → explicit_feedback (+ auto-create item if needed)
+    - Other events (page_view, page_leave) → feedback_events (implicit)
+    """
+    from omnifeed.models import FeedbackEvent, ExplicitFeedback, Item, ContentType, ConsumptionType
+
+    processed = 0
+    skipped = 0
+    for event in request.events:
+        try:
+            timestamp = datetime.fromtimestamp(event.timestamp / 1000)
+            raw_event_type = event.event_type_value
+
+            # Check for duplicate (same second, url)
+            ts_second = timestamp.isoformat()[:19]
+            existing = state.store._conn.execute(
+                """SELECT 1 FROM feedback_events
+                   WHERE substr(timestamp, 1, 19) = ? AND json_extract(payload, '$.url') = ?
+                   LIMIT 1""",
+                (ts_second, event.url)
+            ).fetchone()
+
+            if existing:
+                skipped += 1
+                continue
+
+            # RATING events → explicit_feedback table
+            if raw_event_type == "rating":
+                # Find or create item for this URL
+                item = state.store.get_item_by_url(event.url)
+                if not item:
+                    # Auto-create item from extension
+                    item = Item(
+                        id=uuid.uuid4().hex[:12],
+                        source_id="extension_capture",
+                        external_id=event.url,
+                        url=event.url,
+                        title=event.payload.get("title", event.url.split("/")[-1]),
+                        creator_id=None,
+                        creator_name=event.payload.get("creator_name", "Unknown"),
+                        published_at=timestamp,
+                        ingested_at=datetime.utcnow(),
+                        content_type=ContentType.VIDEO if "video" in event.url else ContentType.ARTICLE,
+                        consumption_type=ConsumptionType.ONE_SHOT,
+                        metadata={
+                            "captured_by": "extension",
+                            "platform": event.payload.get("platform", "web"),
+                        },
+                    )
+                    state.store.upsert_item(item)
+                    logger.info(f"Auto-created item from extension rating: {item.title}")
+
+                # Check for duplicate explicit feedback (same item, same second)
+                existing_fb = state.store._conn.execute(
+                    """SELECT 1 FROM explicit_feedback
+                       WHERE item_id = ? AND substr(timestamp, 1, 19) = ?
+                       LIMIT 1""",
+                    (item.id, ts_second)
+                ).fetchone()
+
+                if existing_fb:
+                    skipped += 1
+                    continue
+
+                # Create explicit feedback
+                explicit_fb = ExplicitFeedback(
+                    id=uuid.uuid4().hex[:12],
+                    item_id=item.id,
+                    timestamp=timestamp,
+                    reward_score=event.payload.get("rewardScore", 2.5),
+                    selections=event.payload.get("selections", {}),
+                    notes=event.payload.get("notes"),
+                    completion_pct=event.payload.get("completionPct", 0),
+                    is_checkpoint=False,
+                )
+                state.store.add_explicit_feedback(explicit_fb)
+                processed += 1
+
+            # OTHER events → feedback_events table (implicit feedback)
+            else:
+                feedback_event = FeedbackEvent(
+                    id=uuid.uuid4().hex[:12],
+                    item_id=event.item_id or "",
+                    timestamp=timestamp,
+                    event_type=f"extension_{raw_event_type}",
+                    payload={
+                        **event.payload,
+                        "url": event.url,
+                        "session_id": request.session_id or "",
+                        "client_version": request.client_version or "",
+                    },
+                )
+                state.store.add_feedback_event(feedback_event)
+                processed += 1
+
+        except Exception as e:
+            logger.warning(f"Failed to process extension event: {e}")
+
+    return ExtensionEventsResponse(
+        received=len(request.events),
+        processed=processed,
+    )
+
+
+class ExtensionItemRequest(BaseModel):
+    url: str
+    title: str
+    creator_name: str | None = None
+    content_type: str = "other"
+    platform: str | None = None
+    external_id: str | None = None
+    thumbnail_url: str | None = None
+    metadata: dict[str, Any] = {}
+
+
+class ExtensionItemResponse(BaseModel):
+    item_id: str
+    created: bool
+    matched_existing: bool
+
+
+@app.post("/api/extension/items", response_model=ExtensionItemResponse)
+def create_extension_item(request: ExtensionItemRequest):
+    """Create or find item from extension capture."""
+    from omnifeed.models import ContentType, ConsumptionType
+
+    # Check if item exists by URL
+    existing = state.store.get_item_by_url(request.url)
+    if existing:
+        return ExtensionItemResponse(
+            item_id=existing.id,
+            created=False,
+            matched_existing=True,
+        )
+
+    # Map content type
+    content_type_map = {
+        "video": ContentType.VIDEO,
+        "audio": ContentType.AUDIO,
+        "article": ContentType.ARTICLE,
+        "image": ContentType.IMAGE,
+    }
+    content_type = content_type_map.get(request.content_type, ContentType.ARTICLE)
+
+    # Find or create creator
+    creator = None
+    if request.creator_name:
+        creator = _find_or_create_creator(
+            store=state.store,
+            name=request.creator_name,
+            source_type=request.platform or "extension",
+            raw_metadata=request.metadata,
+        )
+
+    # Create extension source if needed
+    extension_source = state.store.get_source_by_uri("extension://captured")
+    if not extension_source:
+        from omnifeed.models import Source, SourceInfo
+        source_info = SourceInfo(
+            source_type="extension",
+            uri="extension://captured",
+            display_name="Browser Extension",
+            metadata={},
+        )
+        extension_source = state.store.add_source(source_info)
+
+    # Create item
+    item = Item(
+        id=uuid.uuid4().hex[:12],
+        source_id=extension_source.id,
+        external_id=request.external_id or request.url,
+        url=request.url,
+        title=request.title,
+        creator_id=creator.id if creator else None,
+        creator_name=request.creator_name or "Unknown",
+        published_at=datetime.utcnow(),
+        ingested_at=datetime.utcnow(),
+        content_type=content_type,
+        consumption_type=ConsumptionType.ONE_SHOT,
+        metadata={
+            **request.metadata,
+            "platform": request.platform,
+            "thumbnail_url": request.thumbnail_url,
+            "captured_by": "extension",
+        },
+    )
+    state.store.upsert_item(item)
+
+    return ExtensionItemResponse(
+        item_id=item.id,
+        created=True,
+        matched_existing=False,
+    )
+
+
+class ExtensionRatingRequest(BaseModel):
+    url: str
+    item_id: str | None = None
+    reward_score: float
+    selections: dict[str, list[str]] = {}
+    notes: str | None = None
+
+
+class ExtensionRatingResponse(BaseModel):
+    feedback_id: str
+    item_id: str
+
+
+@app.post("/api/extension/rating", response_model=ExtensionRatingResponse)
+def submit_extension_rating(request: ExtensionRatingRequest):
+    """Submit explicit rating from browser extension."""
+    from omnifeed.models import ExplicitFeedback
+
+    # Find item by URL or ID
+    item = None
+    if request.item_id:
+        item = state.store.get_item(request.item_id)
+    if not item:
+        item = state.store.get_item_by_url(request.url)
+
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found. Create it first via /api/extension/items")
+
+    # Validate reward score
+    if not 0.0 <= request.reward_score <= 5.0:
+        raise HTTPException(status_code=400, detail="Reward score must be between 0.0 and 5.0")
+
+    feedback = ExplicitFeedback(
+        id=uuid.uuid4().hex[:12],
+        item_id=item.id,
+        timestamp=datetime.utcnow(),
+        reward_score=request.reward_score,
+        selections=request.selections,
+        notes=request.notes,
+    )
+    state.store.add_explicit_feedback(feedback)
+
+    return ExtensionRatingResponse(
+        feedback_id=feedback.id,
+        item_id=item.id,
+    )
+
+
+class MediaUploadRequest(BaseModel):
+    media_type: str  # "audio" or "visual"
+    data: str  # base64 encoded
+    url: str
+    timestamp: int
+
+
+class MediaMatchResponse(BaseModel):
+    matched: bool
+    item_id: str | None = None
+    confidence: float = 0.0
+
+
+@app.post("/api/extension/media", response_model=MediaMatchResponse)
+def upload_extension_media(request: MediaUploadRequest):
+    """Upload audio/visual data for server-side matching.
+
+    TODO: Implement actual fingerprint matching once we have a fingerprint database.
+    For now, this just acknowledges receipt.
+    """
+    logger.info(f"Received {request.media_type} media from extension for {request.url}")
+
+    # TODO: Decode base64 data, generate fingerprint, match against database
+    # For now, return no match
+    return MediaMatchResponse(
+        matched=False,
+        item_id=None,
+        confidence=0.0,
+    )
 
 
 # =============================================================================

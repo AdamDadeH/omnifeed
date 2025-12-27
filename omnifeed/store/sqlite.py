@@ -10,6 +10,8 @@ from omnifeed.models import (
     Source, SourceInfo, SourceStatus, Item, ContentType, ConsumptionType,
     FeedbackEvent, FeedbackDimension, FeedbackOption, ExplicitFeedback,
     ItemAttribution, Creator, CreatorType, CreatorStats, SourceStats,
+    Platform, PlatformCapability, DiscoverySource, DiscoverySignal,
+    PlatformInstance, ContentInfo, SignalType,
 )
 from omnifeed.store.base import Store
 
@@ -131,6 +133,74 @@ CREATE TABLE IF NOT EXISTS creators (
 );
 
 CREATE INDEX IF NOT EXISTS idx_creators_name ON creators(name COLLATE NOCASE);
+
+-- Platform vs Discovery Source Architecture
+
+CREATE TABLE IF NOT EXISTS platforms (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    platform_type TEXT NOT NULL,
+    content_types JSON NOT NULL,
+    capabilities JSON NOT NULL,
+    auth_required INTEGER DEFAULT 0,
+    api_available INTEGER DEFAULT 0,
+    base_url TEXT,
+    url_patterns JSON,
+    metadata JSON,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS discovery_sources (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    content_types JSON NOT NULL,
+    typical_platforms JSON,
+    poll_url TEXT,
+    poll_interval_seconds INTEGER DEFAULT 86400,
+    metadata JSON,
+    created_at TEXT NOT NULL,
+    last_polled_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS discovery_signals (
+    id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL REFERENCES discovery_sources(id),
+    item_id TEXT REFERENCES items(id),
+    content_info JSON,
+    signal_type TEXT NOT NULL DEFAULT 'curated',
+    rank INTEGER,
+    rating REAL,
+    context TEXT,
+    recommender TEXT,
+    url TEXT,
+    discovered_at TEXT NOT NULL,
+    metadata JSON
+);
+
+CREATE INDEX IF NOT EXISTS idx_discovery_signals_source ON discovery_signals(source_id);
+CREATE INDEX IF NOT EXISTS idx_discovery_signals_item ON discovery_signals(item_id);
+CREATE INDEX IF NOT EXISTS idx_discovery_signals_unresolved ON discovery_signals(item_id) WHERE item_id IS NULL;
+
+CREATE TABLE IF NOT EXISTS platform_instances (
+    id TEXT PRIMARY KEY,
+    item_id TEXT NOT NULL REFERENCES items(id),
+    platform_id TEXT NOT NULL REFERENCES platforms(id),
+    platform_item_id TEXT NOT NULL,
+    url TEXT NOT NULL,
+    availability TEXT DEFAULT 'available',
+    quality_tiers JSON,
+    price REAL,
+    currency TEXT,
+    region_locks JSON,
+    match_confidence REAL DEFAULT 1.0,
+    discovered_at TEXT NOT NULL,
+    metadata JSON,
+    UNIQUE(item_id, platform_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_platform_instances_item ON platform_instances(item_id);
+CREATE INDEX IF NOT EXISTS idx_platform_instances_platform ON platform_instances(platform_id);
 """
 
 
@@ -249,6 +319,131 @@ def _row_to_creator(row: sqlite3.Row) -> Creator:
         metadata=metadata,
         created_at=_str_to_datetime(row["created_at"]),
         updated_at=_str_to_datetime(row["updated_at"]),
+    )
+
+
+def _row_to_platform(row: sqlite3.Row) -> Platform:
+    """Convert a database row to a Platform."""
+    content_types = []
+    if row["content_types"]:
+        content_types = [ContentType(ct) for ct in json.loads(row["content_types"])]
+
+    capabilities = []
+    if row["capabilities"]:
+        capabilities = [PlatformCapability(c) for c in json.loads(row["capabilities"])]
+
+    url_patterns = []
+    if row["url_patterns"]:
+        url_patterns = json.loads(row["url_patterns"])
+
+    metadata = {}
+    if row["metadata"]:
+        metadata = json.loads(row["metadata"])
+
+    return Platform(
+        id=row["id"],
+        name=row["name"],
+        platform_type=row["platform_type"],
+        content_types=content_types,
+        capabilities=capabilities,
+        auth_required=bool(row["auth_required"]),
+        api_available=bool(row["api_available"]),
+        base_url=row["base_url"],
+        url_patterns=url_patterns,
+        metadata=metadata,
+        created_at=_str_to_datetime(row["created_at"]),
+    )
+
+
+def _row_to_discovery_source(row: sqlite3.Row) -> DiscoverySource:
+    """Convert a database row to a DiscoverySource."""
+    content_types = []
+    if row["content_types"]:
+        content_types = [ContentType(ct) for ct in json.loads(row["content_types"])]
+
+    typical_platforms = []
+    if row["typical_platforms"]:
+        typical_platforms = json.loads(row["typical_platforms"])
+
+    metadata = {}
+    if row["metadata"]:
+        metadata = json.loads(row["metadata"])
+
+    return DiscoverySource(
+        id=row["id"],
+        name=row["name"],
+        source_type=row["source_type"],
+        content_types=content_types,
+        typical_platforms=typical_platforms,
+        poll_url=row["poll_url"],
+        poll_interval_seconds=row["poll_interval_seconds"],
+        metadata=metadata,
+        created_at=_str_to_datetime(row["created_at"]),
+        last_polled_at=_str_to_datetime(row["last_polled_at"]) if row["last_polled_at"] else None,
+    )
+
+
+def _row_to_discovery_signal(row: sqlite3.Row) -> DiscoverySignal:
+    """Convert a database row to a DiscoverySignal."""
+    content_info = None
+    if row["content_info"]:
+        ci_data = json.loads(row["content_info"])
+        content_info = ContentInfo(
+            content_type=ContentType(ci_data["content_type"]),
+            title=ci_data["title"],
+            creators=ci_data.get("creators", []),
+            year=ci_data.get("year"),
+            external_ids=ci_data.get("external_ids", {}),
+        )
+
+    metadata = {}
+    if row["metadata"]:
+        metadata = json.loads(row["metadata"])
+
+    return DiscoverySignal(
+        id=row["id"],
+        source_id=row["source_id"],
+        item_id=row["item_id"],
+        content_info=content_info,
+        signal_type=SignalType(row["signal_type"]) if row["signal_type"] else SignalType.CURATED,
+        rank=row["rank"],
+        rating=row["rating"],
+        context=row["context"],
+        recommender=row["recommender"],
+        url=row["url"],
+        discovered_at=_str_to_datetime(row["discovered_at"]),
+        metadata=metadata,
+    )
+
+
+def _row_to_platform_instance(row: sqlite3.Row) -> PlatformInstance:
+    """Convert a database row to a PlatformInstance."""
+    quality_tiers = []
+    if row["quality_tiers"]:
+        quality_tiers = json.loads(row["quality_tiers"])
+
+    region_locks = []
+    if row["region_locks"]:
+        region_locks = json.loads(row["region_locks"])
+
+    metadata = {}
+    if row["metadata"]:
+        metadata = json.loads(row["metadata"])
+
+    return PlatformInstance(
+        id=row["id"],
+        item_id=row["item_id"],
+        platform_id=row["platform_id"],
+        platform_item_id=row["platform_item_id"],
+        url=row["url"],
+        availability=row["availability"],
+        quality_tiers=quality_tiers,
+        price=row["price"],
+        currency=row["currency"],
+        region_locks=region_locks,
+        match_confidence=row["match_confidence"],
+        discovered_at=_str_to_datetime(row["discovered_at"]),
+        metadata=metadata,
     )
 
 

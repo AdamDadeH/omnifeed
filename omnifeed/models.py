@@ -40,6 +40,27 @@ class ConsumptionType(Enum):
     SERIALIZED = "serialized"  # Part of a series (episode, chapter)
 
 
+class PlatformCapability(Enum):
+    """Capabilities a platform can provide for content delivery."""
+    STREAM = "stream"           # Can play in-app (YouTube, Spotify)
+    DOWNLOAD = "download"       # Can download for offline
+    PURCHASE = "purchase"       # Can buy permanently (Bandcamp, Qobuz)
+    EMBED = "embed"            # Can embed in other pages (YouTube, Spotify)
+    RENDER = "render"          # Can render content (articles, HTML)
+
+
+class SignalType(Enum):
+    """Type of discovery signal indicating why content is recommended."""
+    CHART_POSITION = "chart_position"   # Ranked on a chart (RYM top albums)
+    USER_RATING = "user_rating"         # User rating (4.5 stars on Letterboxd)
+    RECOMMENDATION = "recommendation"   # Personal recommendation
+    MENTION = "mention"                 # Mentioned in content (podcast discussed)
+    AWARD = "award"                     # Won or nominated for award
+    TRENDING = "trending"               # Viral or trending
+    ALGORITHMIC = "algorithmic"         # Algorithm thinks you'll like it
+    CURATED = "curated"                 # Expert/editorial curation
+
+
 class CreatorType(Enum):
     """Type of content creator."""
     INDIVIDUAL = "individual"  # Single person
@@ -262,3 +283,141 @@ class SourceStats:
 
     # Unique creators whose content appears in this source
     unique_creators: int = 0
+
+
+# =============================================================================
+# Platform vs Discovery Source Architecture
+#
+# Platform: Delivers consumable media bytes or renderable content.
+#   Examples: YouTube, Qobuz, Spotify, Netflix, Bandcamp
+#
+# DiscoverySource: Provides signals about what content exists and why you
+#   should engage with it. Points TO content, doesn't host it.
+#   Examples: RateYourMusic charts, Letterboxd lists, award lists, newsletters
+# =============================================================================
+
+
+@dataclass
+class Platform:
+    """A service that delivers consumable media (video, audio, articles).
+
+    Platforms can stream, download, or render actual content. They may also
+    have discovery features (recommendations, trending), but their primary
+    function is content delivery.
+
+    Examples: YouTube, Qobuz, Spotify, Bandcamp, Netflix
+    """
+    id: str
+    name: str                                    # "Qobuz", "YouTube"
+    platform_type: str                           # "music_streaming", "video_streaming"
+    content_types: list[ContentType]             # [AUDIO], [VIDEO], etc.
+    capabilities: list[PlatformCapability]       # [STREAM, DOWNLOAD, PURCHASE]
+
+    # Configuration
+    auth_required: bool = False
+    api_available: bool = False
+    base_url: str | None = None                  # "https://www.qobuz.com"
+
+    # Matching configuration
+    url_patterns: list[str] = field(default_factory=list)  # ["qobuz.com/album/"]
+
+    metadata: dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=datetime.utcnow)
+
+
+@dataclass
+class DiscoverySource:
+    """A source that provides signals about content worth consuming.
+
+    Discovery sources point TO content but don't host it. They provide context
+    about why you should engage (rankings, ratings, recommendations, awards).
+
+    Examples: RateYourMusic charts, Letterboxd lists, Hugo Awards, newsletters
+    """
+    id: str
+    name: str                                    # "RateYourMusic Charts"
+    source_type: str                             # "chart", "list", "awards", "newsletter"
+    content_types: list[ContentType]             # [AUDIO] for RYM, [FILM] for Letterboxd
+
+    # Which platforms typically have this content
+    typical_platforms: list[str] = field(default_factory=list)  # ["qobuz", "spotify"]
+
+    # Polling configuration for scraping
+    poll_url: str | None = None
+    poll_interval_seconds: int = 86400           # Daily by default
+
+    metadata: dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    last_polled_at: datetime | None = None
+
+
+@dataclass
+class ContentInfo:
+    """Extracted information about content from a discovery signal.
+
+    This is the "pointer" data extracted from a discovery source - just enough
+    to identify and match the content across platforms.
+    """
+    content_type: ContentType
+    title: str
+    creators: list[str]                          # ["Artist Name"]
+    year: int | None = None
+
+    # Known external IDs (may be partial)
+    external_ids: dict[str, str] = field(default_factory=dict)  # {"rym": "album/123"}
+
+
+@dataclass
+class DiscoverySignal:
+    """A signal from a discovery source about content worth consuming.
+
+    Links discovery sources to content with context about why it's recommended.
+    One piece of content can have multiple signals from different sources.
+    """
+    id: str
+    source_id: str                               # FK to DiscoverySource
+    item_id: str | None = None                   # FK to Item (resolved content)
+
+    # Content identification (before resolution)
+    content_info: ContentInfo | None = None
+
+    # Signal metadata
+    signal_type: SignalType = SignalType.CURATED
+    rank: int | None = None                      # Position in list (1 = top)
+    rating: float | None = None                  # Source rating (e.g., RYM 3.92)
+    context: str | None = None                   # "#3 on RYM Top Albums 2025"
+    recommender: str | None = None               # Who recommended (for social)
+    url: str | None = None                       # Link to discovery page
+
+    discovered_at: datetime = field(default_factory=datetime.utcnow)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class PlatformInstance:
+    """Where a piece of content can be consumed on a platform.
+
+    Links content (Item) to platforms where it's available. One piece of
+    content may be available on multiple platforms with different quality
+    tiers, prices, and availability.
+    """
+    id: str
+    item_id: str                                 # FK to Item (content)
+    platform_id: str                             # FK to Platform
+    platform_item_id: str                        # ID within the platform
+    url: str                                     # Direct URL to consume
+
+    # Availability info
+    availability: str = "available"              # "available", "region_locked", "unavailable"
+    quality_tiers: list[str] = field(default_factory=list)  # ["FLAC", "Hi-Res 24-bit"]
+    price: float | None = None                   # For purchase platforms
+    currency: str | None = None
+
+    # Region restrictions
+    region_locks: list[str] = field(default_factory=list)  # ["US", "EU"]
+
+    # Match confidence (0.0-1.0) when auto-matched
+    match_confidence: float = 1.0
+
+    discovered_at: datetime = field(default_factory=datetime.utcnow)
+    metadata: dict[str, Any] = field(default_factory=dict)
