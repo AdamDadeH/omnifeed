@@ -9,7 +9,7 @@ from pathlib import Path
 from omnifeed.models import (
     Source, SourceInfo, SourceStatus, Item, ContentType, ConsumptionType,
     FeedbackEvent, FeedbackDimension, FeedbackOption, ExplicitFeedback,
-    ItemAttribution,
+    ItemAttribution, Creator, CreatorType, CreatorStats, SourceStats,
 )
 from omnifeed.store.base import Store
 
@@ -115,6 +115,22 @@ CREATE TABLE IF NOT EXISTS item_attributions (
 
 CREATE INDEX IF NOT EXISTS idx_attributions_item ON item_attributions(item_id);
 CREATE INDEX IF NOT EXISTS idx_attributions_source ON item_attributions(source_id);
+
+CREATE TABLE IF NOT EXISTS creators (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    name_variants JSON,
+    creator_type TEXT DEFAULT 'unknown',
+    external_ids JSON,
+    avatar_url TEXT,
+    bio TEXT,
+    url TEXT,
+    metadata JSON,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_creators_name ON creators(name COLLATE NOCASE);
 """
 
 
@@ -169,12 +185,20 @@ def _row_to_item(row: sqlite3.Row) -> Item:
         # Column might not exist in older DBs
         pass
 
+    # Handle creator_id
+    creator_id = None
+    try:
+        creator_id = row["creator_id"]
+    except (KeyError, IndexError):
+        pass
+
     return Item(
         id=row["id"],
         source_id=row["source_id"],
         external_id=row["external_id"],
         url=row["url"],
         title=row["title"],
+        creator_id=creator_id,
         creator_name=row["creator_name"],
         published_at=_str_to_datetime(row["published_at"]),
         ingested_at=_str_to_datetime(row["ingested_at"]),
@@ -187,6 +211,71 @@ def _row_to_item(row: sqlite3.Row) -> Item:
         series_id=row["series_id"],
         series_position=row["series_position"],
         embeddings=embeddings,
+    )
+
+
+def _row_to_creator(row: sqlite3.Row) -> Creator:
+    """Convert a database row to a Creator."""
+    name_variants = []
+    try:
+        if row["name_variants"]:
+            name_variants = json.loads(row["name_variants"])
+    except (KeyError, IndexError):
+        pass
+
+    external_ids = {}
+    try:
+        if row["external_ids"]:
+            external_ids = json.loads(row["external_ids"])
+    except (KeyError, IndexError):
+        pass
+
+    metadata = {}
+    try:
+        if row["metadata"]:
+            metadata = json.loads(row["metadata"])
+    except (KeyError, IndexError):
+        pass
+
+    return Creator(
+        id=row["id"],
+        name=row["name"],
+        name_variants=name_variants,
+        creator_type=CreatorType(row["creator_type"]) if row["creator_type"] else CreatorType.UNKNOWN,
+        external_ids=external_ids,
+        avatar_url=row["avatar_url"],
+        bio=row["bio"],
+        url=row["url"],
+        metadata=metadata,
+        created_at=_str_to_datetime(row["created_at"]),
+        updated_at=_str_to_datetime(row["updated_at"]),
+    )
+
+
+def _row_to_attribution(row: sqlite3.Row) -> ItemAttribution:
+    """Convert a database row to an ItemAttribution."""
+    # Handle new columns that may not exist in older DBs
+    external_id = ""
+    is_primary = False
+    try:
+        external_id = row["external_id"] or ""
+    except (KeyError, IndexError):
+        pass
+    try:
+        is_primary = bool(row["is_primary"])
+    except (KeyError, IndexError):
+        pass
+
+    return ItemAttribution(
+        id=row["id"],
+        item_id=row["item_id"],
+        source_id=row["source_id"],
+        discovered_at=_str_to_datetime(row["discovered_at"]),
+        external_id=external_id,
+        is_primary=is_primary,
+        rank=row["rank"],
+        context=row["context"],
+        metadata=json.loads(row["metadata"]) if row["metadata"] else {},
     )
 
 
@@ -245,6 +334,24 @@ class SQLiteStore(Store):
                         )
                     except Exception:
                         pass
+            self._conn.commit()
+
+        # Add creator_id column if missing
+        if "creator_id" not in columns:
+            self._conn.execute("ALTER TABLE items ADD COLUMN creator_id TEXT REFERENCES creators(id)")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_items_creator ON items(creator_id)")
+            self._conn.commit()
+
+        # Migrate item_attributions table for new columns
+        cursor = self._conn.execute("PRAGMA table_info(item_attributions)")
+        attr_columns = {row[1] for row in cursor.fetchall()}
+
+        if "is_primary" not in attr_columns:
+            self._conn.execute("ALTER TABLE item_attributions ADD COLUMN is_primary INTEGER DEFAULT 0")
+            self._conn.commit()
+
+        if "external_id" not in attr_columns:
+            self._conn.execute("ALTER TABLE item_attributions ADD COLUMN external_id TEXT")
             self._conn.commit()
 
     # Sources
@@ -321,6 +428,211 @@ class SQLiteStore(Store):
         self._conn.commit()
         return items_deleted
 
+    def get_source_stats(self, source_id: str) -> SourceStats:
+        """Get aggregated stats for a source from content feedback."""
+        # Count items from this source
+        cursor = self._conn.execute(
+            "SELECT COUNT(*) FROM items WHERE source_id = ?", (source_id,)
+        )
+        total_items = cursor.fetchone()[0]
+
+        # Get item IDs for this source
+        cursor = self._conn.execute(
+            "SELECT id FROM items WHERE source_id = ?", (source_id,)
+        )
+        item_ids = [row[0] for row in cursor.fetchall()]
+
+        if not item_ids:
+            return SourceStats(source_id=source_id, total_items=0)
+
+        placeholders = ",".join("?" * len(item_ids))
+
+        # Count feedback events
+        cursor = self._conn.execute(
+            f"SELECT COUNT(*) FROM feedback_events WHERE item_id IN ({placeholders})",
+            item_ids
+        )
+        total_feedback = cursor.fetchone()[0]
+
+        # Get average reward score
+        cursor = self._conn.execute(
+            f"SELECT AVG(reward_score) FROM explicit_feedback WHERE item_id IN ({placeholders})",
+            item_ids
+        )
+        avg_reward = cursor.fetchone()[0]
+
+        # Count unique creators
+        cursor = self._conn.execute(
+            f"SELECT COUNT(DISTINCT creator_id) FROM items WHERE source_id = ? AND creator_id IS NOT NULL",
+            (source_id,)
+        )
+        unique_creators = cursor.fetchone()[0]
+
+        return SourceStats(
+            source_id=source_id,
+            total_items=total_items,
+            total_feedback_events=total_feedback,
+            avg_reward_score=avg_reward,
+            unique_creators=unique_creators,
+        )
+
+    # Creators
+
+    def add_creator(self, creator: Creator) -> Creator:
+        """Add a new creator. Returns the created Creator with ID."""
+        if not creator.id:
+            creator.id = _generate_id()
+
+        self._conn.execute(
+            """
+            INSERT INTO creators (
+                id, name, name_variants, creator_type, external_ids,
+                avatar_url, bio, url, metadata, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                creator.id,
+                creator.name,
+                json.dumps(creator.name_variants) if creator.name_variants else None,
+                creator.creator_type.value,
+                json.dumps(creator.external_ids) if creator.external_ids else None,
+                creator.avatar_url,
+                creator.bio,
+                creator.url,
+                json.dumps(creator.metadata) if creator.metadata else None,
+                _datetime_to_str(creator.created_at),
+                _datetime_to_str(creator.updated_at),
+            ),
+        )
+        self._conn.commit()
+        return creator
+
+    def get_creator(self, creator_id: str) -> Creator | None:
+        """Get a creator by ID."""
+        cursor = self._conn.execute("SELECT * FROM creators WHERE id = ?", (creator_id,))
+        row = cursor.fetchone()
+        return _row_to_creator(row) if row else None
+
+    def get_creator_by_name(self, name: str) -> Creator | None:
+        """Find a creator by exact name match (case-insensitive)."""
+        cursor = self._conn.execute(
+            "SELECT * FROM creators WHERE name = ? COLLATE NOCASE",
+            (name.strip(),)
+        )
+        row = cursor.fetchone()
+        return _row_to_creator(row) if row else None
+
+    def find_creator_by_external_id(self, id_type: str, id_value: str) -> Creator | None:
+        """Find a creator by external ID (e.g., YouTube channel ID)."""
+        cursor = self._conn.execute(
+            "SELECT * FROM creators WHERE json_extract(external_ids, ?) = ?",
+            (f"$.{id_type}", id_value)
+        )
+        row = cursor.fetchone()
+        return _row_to_creator(row) if row else None
+
+    def update_creator(self, creator: Creator) -> None:
+        """Update creator metadata."""
+        creator.updated_at = datetime.utcnow()
+        self._conn.execute(
+            """
+            UPDATE creators SET
+                name = ?,
+                name_variants = ?,
+                creator_type = ?,
+                external_ids = ?,
+                avatar_url = ?,
+                bio = ?,
+                url = ?,
+                metadata = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                creator.name,
+                json.dumps(creator.name_variants) if creator.name_variants else None,
+                creator.creator_type.value,
+                json.dumps(creator.external_ids) if creator.external_ids else None,
+                creator.avatar_url,
+                creator.bio,
+                creator.url,
+                json.dumps(creator.metadata) if creator.metadata else None,
+                _datetime_to_str(creator.updated_at),
+                creator.id,
+            ),
+        )
+        self._conn.commit()
+
+    def list_creators(self, limit: int = 100, offset: int = 0) -> list[Creator]:
+        """List all creators."""
+        cursor = self._conn.execute(
+            "SELECT * FROM creators ORDER BY name COLLATE NOCASE LIMIT ? OFFSET ?",
+            (limit, offset)
+        )
+        return [_row_to_creator(row) for row in cursor.fetchall()]
+
+    def get_creator_stats(self, creator_id: str) -> CreatorStats:
+        """Get aggregated stats for a creator from content feedback."""
+        # Count items by this creator
+        cursor = self._conn.execute(
+            "SELECT COUNT(*) FROM items WHERE creator_id = ?", (creator_id,)
+        )
+        total_items = cursor.fetchone()[0]
+
+        # Get item IDs for this creator
+        cursor = self._conn.execute(
+            "SELECT id, content_type FROM items WHERE creator_id = ?", (creator_id,)
+        )
+        rows = cursor.fetchall()
+        item_ids = [row[0] for row in rows]
+
+        # Count content types
+        content_types: dict[str, int] = {}
+        for row in rows:
+            ct = row[1]
+            content_types[ct] = content_types.get(ct, 0) + 1
+
+        if not item_ids:
+            return CreatorStats(creator_id=creator_id, total_items=0)
+
+        placeholders = ",".join("?" * len(item_ids))
+
+        # Count feedback events
+        cursor = self._conn.execute(
+            f"SELECT COUNT(*) FROM feedback_events WHERE item_id IN ({placeholders})",
+            item_ids
+        )
+        total_feedback = cursor.fetchone()[0]
+
+        # Get average reward score
+        cursor = self._conn.execute(
+            f"SELECT AVG(reward_score) FROM explicit_feedback WHERE item_id IN ({placeholders})",
+            item_ids
+        )
+        avg_reward = cursor.fetchone()[0]
+
+        return CreatorStats(
+            creator_id=creator_id,
+            total_items=total_items,
+            total_feedback_events=total_feedback,
+            avg_reward_score=avg_reward,
+            content_types=content_types,
+        )
+
+    def get_items_by_creator(self, creator_id: str, limit: int = 50, offset: int = 0) -> list[Item]:
+        """Get items created by a specific creator."""
+        cursor = self._conn.execute(
+            """
+            SELECT * FROM items
+            WHERE creator_id = ?
+            ORDER BY published_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            (creator_id, limit, offset)
+        )
+        return [_row_to_item(row) for row in cursor.fetchall()]
+
     # Items
 
     def upsert_item(self, item: Item) -> None:
@@ -328,14 +640,15 @@ class SQLiteStore(Store):
         self._conn.execute(
             """
             INSERT INTO items (
-                id, source_id, external_id, url, title, creator_name,
+                id, source_id, external_id, url, title, creator_id, creator_name,
                 published_at, ingested_at, content_type, consumption_type,
                 metadata, canonical_ids, seen, hidden, series_id, series_position, embeddings
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(source_id, external_id) DO UPDATE SET
                 url = excluded.url,
                 title = excluded.title,
+                creator_id = excluded.creator_id,
                 creator_name = excluded.creator_name,
                 published_at = excluded.published_at,
                 content_type = excluded.content_type,
@@ -352,6 +665,7 @@ class SQLiteStore(Store):
                 item.external_id,
                 item.url,
                 item.title,
+                item.creator_id,
                 item.creator_name,
                 _datetime_to_str(item.published_at),
                 _datetime_to_str(item.ingested_at),
@@ -766,9 +1080,14 @@ class SQLiteStore(Store):
         """Add an attribution linking an item to a source."""
         self._conn.execute(
             """
-            INSERT INTO item_attributions (id, item_id, source_id, discovered_at, rank, context, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO item_attributions (
+                id, item_id, source_id, discovered_at, external_id, is_primary,
+                rank, context, metadata
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(item_id, source_id) DO UPDATE SET
+                external_id = excluded.external_id,
+                is_primary = excluded.is_primary,
                 rank = excluded.rank,
                 context = excluded.context,
                 metadata = excluded.metadata
@@ -778,6 +1097,8 @@ class SQLiteStore(Store):
                 attribution.item_id,
                 attribution.source_id,
                 _datetime_to_str(attribution.discovered_at),
+                attribution.external_id,
+                int(attribution.is_primary),
                 attribution.rank,
                 attribution.context,
                 json.dumps(attribution.metadata) if attribution.metadata else None,
@@ -788,21 +1109,10 @@ class SQLiteStore(Store):
     def get_attributions(self, item_id: str) -> list[ItemAttribution]:
         """Get all attributions for an item."""
         cursor = self._conn.execute(
-            "SELECT * FROM item_attributions WHERE item_id = ? ORDER BY discovered_at",
+            "SELECT * FROM item_attributions WHERE item_id = ? ORDER BY is_primary DESC, discovered_at",
             (item_id,),
         )
-        return [
-            ItemAttribution(
-                id=row["id"],
-                item_id=row["item_id"],
-                source_id=row["source_id"],
-                discovered_at=_str_to_datetime(row["discovered_at"]),
-                rank=row["rank"],
-                context=row["context"],
-                metadata=json.loads(row["metadata"]) if row["metadata"] else {},
-            )
-            for row in cursor.fetchall()
-        ]
+        return [_row_to_attribution(row) for row in cursor.fetchall()]
 
     def get_attribution(self, item_id: str, source_id: str) -> ItemAttribution | None:
         """Get a specific attribution for an item from a source."""
@@ -811,17 +1121,12 @@ class SQLiteStore(Store):
             (item_id, source_id),
         )
         row = cursor.fetchone()
-        if not row:
-            return None
-        return ItemAttribution(
-            id=row["id"],
-            item_id=row["item_id"],
-            source_id=row["source_id"],
-            discovered_at=_str_to_datetime(row["discovered_at"]),
-            rank=row["rank"],
-            context=row["context"],
-            metadata=json.loads(row["metadata"]) if row["metadata"] else {},
-        )
+        return _row_to_attribution(row) if row else None
+
+    def upsert_attribution(self, attribution: ItemAttribution) -> None:
+        """Add or update an attribution (upsert by item_id + source_id)."""
+        # Same as add_attribution - the ON CONFLICT handles upsert
+        self.add_attribution(attribution)
 
     def get_items_by_source_attribution(self, source_id: str, limit: int = 50) -> list[Item]:
         """Get items attributed to a source (even if not the primary source)."""

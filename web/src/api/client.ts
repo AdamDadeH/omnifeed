@@ -283,3 +283,29 @@ export async function deleteSitemapConfig(domain: string): Promise<void> {
     method: 'DELETE',
   });
 }
+
+// Creators
+
+export async function getCreators(limit = 100, offset = 0): Promise<import('./types').Creator[]> {
+  return fetchJson(`${API_BASE}/creators?limit=${limit}&offset=${offset}`);
+}
+
+export async function getCreator(creatorId: string): Promise<import('./types').Creator> {
+  return fetchJson(`${API_BASE}/creators/${creatorId}`);
+}
+
+export async function getCreatorStats(creatorId: string): Promise<import('./types').CreatorStats> {
+  return fetchJson(`${API_BASE}/creators/${creatorId}/stats`);
+}
+
+export async function getCreatorItems(
+  creatorId: string,
+  limit = 50,
+  offset = 0
+): Promise<FeedItem[]> {
+  return fetchJson(`${API_BASE}/creators/${creatorId}/items?limit=${limit}&offset=${offset}`);
+}
+
+export async function getSourceStats(sourceId: string): Promise<import('./types').SourceStats> {
+  return fetchJson(`${API_BASE}/sources/${sourceId}/stats`);
+}

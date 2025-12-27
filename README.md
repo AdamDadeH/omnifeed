@@ -220,10 +220,12 @@ omnifeed/                 # Core Python library
   │   ├── bandcamp/       # Bandcamp artists, labels, fans
   │   ├── qobuz/          # Qobuz music catalog
   │   ├── tiktok/         # TikTok via RSSHub/ProxiTok
-  │   └── sitemap/        # Website sitemaps
+  │   └── sitemap/        # Website sitemaps (config-driven extraction)
   ├── ranking/            # ML ranking pipeline
   │   ├── pipeline.py     # Retrieval + scoring
-  │   ├── model.py        # Click & reward prediction
+  │   ├── model.py        # Default click & reward model
+  │   ├── multi_objective.py  # Per-objective reward heads
+  │   ├── registry.py     # Model registry
   │   └── embeddings.py   # Text embeddings
   ├── discovery/          # LLM-powered discovery
   │   ├── llm.py          # Multi-backend LLM abstraction
@@ -237,9 +239,20 @@ api/                      # FastAPI REST API
 web/                      # React + TypeScript frontend
   └── src/
       ├── api/            # API client
-      ├── components/     # React components
-      │   └── renderers/  # Content-type specific renderers
+      ├── components/
+      │   ├── FeedItem.tsx      # Feed item with link
+      │   ├── FeedList.tsx      # Paginated feed
+      │   ├── ReaderPane.tsx    # Reader with feedback
+      │   ├── StatsView.tsx     # Stats + model training
+      │   ├── SourcesView.tsx   # Source management
+      │   └── renderers/        # Content-type renderers
       └── App.tsx
+
+~/.omnifeed/              # User data
+  ├── omnifeed.db         # SQLite database
+  ├── ranking_model.pkl   # Default model
+  ├── multi_objective_model.pkl  # Multi-objective model
+  └── sitemap_configs/    # Per-domain extraction configs
 ```
 
 ## API Endpoints
@@ -248,16 +261,22 @@ web/                      # React + TypeScript frontend
 |----------|--------|-------------|
 | `/api/sources` | GET | List all sources |
 | `/api/sources` | POST | Add a new source |
+| `/api/sources/{id}` | DELETE | Delete source and its items |
 | `/api/sources/{id}/poll` | POST | Poll source for new items |
-| `/api/feed` | GET | Get ranked feed |
+| `/api/feed` | GET | Get ranked feed (supports `?objective=` filter) |
 | `/api/items/{id}` | GET | Get single item |
 | `/api/items/{id}/seen` | POST | Mark item as seen |
 | `/api/feedback` | POST | Record engagement event |
 | `/api/feedback/explicit` | POST | Submit rating |
+| `/api/feedback/stats` | GET | Get engagement statistics |
 | `/api/discover` | GET | Get source recommendations |
 | `/api/discover/interests` | GET | Get extracted interest profile |
-| `/api/model/train` | POST | Train ranking model |
+| `/api/model/train` | POST | Train ranking model (supports `?model=` param) |
+| `/api/model/status` | GET | Get all models status |
+| `/api/model/objectives` | GET | Get available objectives with training counts |
 | `/api/search` | GET | Search for sources |
+| `/api/sitemap/configs` | GET | List sitemap extraction configs |
+| `/api/sitemap/configs/{domain}` | POST | Create/update sitemap config |
 
 ## Development
 

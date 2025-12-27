@@ -10,10 +10,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from omnifeed.config import Config
-from omnifeed.models import Item, ContentType, ConsumptionType, SourceStatus
+from omnifeed.models import Item, ContentType, ConsumptionType, SourceStatus, Creator, CreatorType, ItemAttribution
 from omnifeed.store import Store
 from omnifeed.adapters import create_default_registry
 from omnifeed.ranking.pipeline import create_default_pipeline
+from omnifeed.creators import extract_from_item
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -59,6 +63,7 @@ class ItemResponse(BaseModel):
     source_name: str
     url: str
     title: str
+    creator_id: str | None = None
     creator_name: str
     published_at: datetime
     content_type: str
@@ -171,6 +176,35 @@ class ExplicitFeedbackResponse(BaseModel):
     notes: str | None
     completion_pct: float | None
     is_checkpoint: bool
+
+
+# Creator models
+
+class CreatorResponse(BaseModel):
+    id: str
+    name: str
+    creator_type: str
+    avatar_url: str | None
+    bio: str | None
+    url: str | None
+    item_count: int = 0
+    avg_score: float | None = None
+
+
+class CreatorStatsResponse(BaseModel):
+    creator_id: str
+    total_items: int
+    total_feedback_events: int
+    avg_reward_score: float | None
+    content_types: dict[str, int]
+
+
+class SourceStatsResponse(BaseModel):
+    source_id: str
+    total_items: int
+    total_feedback_events: int
+    avg_reward_score: float | None
+    unique_creators: int
 
 
 # =============================================================================
@@ -360,6 +394,74 @@ def add_source(request: AddSourceRequest):
     )
 
 
+def _find_or_create_creator(
+    store: Store,
+    name: str,
+    source_type: str,
+    raw_metadata: dict[str, Any],
+) -> Creator | None:
+    """Find or create a creator based on available metadata.
+
+    Matching strategy:
+    1. External IDs (e.g., YouTube channel_id) - most reliable
+    2. Exact name match (case-insensitive)
+    3. Create new creator if no match
+
+    Returns None if name is empty/whitespace.
+    """
+    name = name.strip()
+    if not name:
+        return None
+
+    # Build external_ids from metadata based on source type
+    external_ids: dict[str, str] = {}
+    avatar_url: str | None = None
+
+    if source_type in ("youtube_channel", "youtube_playlist"):
+        channel_id = raw_metadata.get("channel_id")
+        if channel_id:
+            external_ids["youtube"] = channel_id
+        # Use channel thumbnail as avatar if available
+        avatar_url = raw_metadata.get("thumbnail")
+
+    # Try to find by external ID first (most reliable)
+    for id_type, id_value in external_ids.items():
+        existing = store.find_creator_by_external_id(id_type, id_value)
+        if existing:
+            logger.debug(f"Found creator by {id_type} ID: {existing.name}")
+            return existing
+
+    # Try exact name match (case-insensitive)
+    existing = store.get_creator_by_name(name)
+    if existing:
+        # If we have new external IDs, update the creator
+        if external_ids:
+            updated = False
+            for id_type, id_value in external_ids.items():
+                if id_type not in existing.external_ids:
+                    existing.external_ids[id_type] = id_value
+                    updated = True
+            if updated:
+                existing.updated_at = datetime.utcnow()
+                store.update_creator(existing)
+                logger.debug(f"Updated creator with new external IDs: {existing.name}")
+        return existing
+
+    # Create new creator
+    creator = Creator(
+        id=uuid.uuid4().hex[:12],
+        name=name,
+        creator_type=CreatorType.UNKNOWN,
+        external_ids=external_ids,
+        avatar_url=avatar_url,
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    store.add_creator(creator)
+    logger.info(f"Created new creator: {creator.name} (id={creator.id})")
+    return creator
+
+
 @app.post("/api/sources/{source_id}/poll", response_model=PollResult)
 def poll_source(source_id: str):
     """Poll a source for new items."""
@@ -405,18 +507,54 @@ def poll_source(source_id: str):
                     content_type = ContentType.VIDEO
                     break
 
+        # Extract creator info and find or create creator
+        creator_name = raw.raw_metadata.get("author", source.display_name)
+        creator = _find_or_create_creator(
+            store=state.store,
+            name=creator_name,
+            source_type=source.source_type,
+            raw_metadata=raw.raw_metadata,
+        )
+
+        # Extract additional creators from description
+        extracted_creators = extract_from_item(raw.raw_metadata, raw.title, source.source_type)
+        extracted_creator_data = []
+        for ec in extracted_creators:
+            if ec.confidence >= 0.7:
+                # Create or find Creator entity for high-confidence extractions
+                extracted_creator = _find_or_create_creator(
+                    store=state.store,
+                    name=ec.name,
+                    source_type=source.source_type,
+                    raw_metadata={},  # No additional metadata for extracted creators
+                )
+                if extracted_creator:
+                    extracted_creator_data.append({
+                        "creator_id": extracted_creator.id,
+                        "name": ec.name,
+                        "role": ec.role,
+                        "confidence": ec.confidence,
+                    })
+                    logger.debug(f"Extracted creator: {ec.name} ({ec.role}) -> {extracted_creator.id}")
+
+        # Add extracted creators to metadata
+        item_metadata = dict(raw.raw_metadata)
+        if extracted_creator_data:
+            item_metadata["extracted_creators"] = extracted_creator_data
+
         item = Item(
             id=uuid.uuid4().hex[:12],
             source_id=source_id,
             external_id=raw.external_id,
             url=raw.url,
             title=raw.title,
-            creator_name=raw.raw_metadata.get("author", source.display_name),
+            creator_id=creator.id if creator else None,
+            creator_name=creator_name,
             published_at=raw.published_at,
             ingested_at=datetime.utcnow(),
             content_type=content_type,
             consumption_type=ConsumptionType.ONE_SHOT,
-            metadata=raw.raw_metadata,
+            metadata=item_metadata,
         )
         new_items.append(item)
 
@@ -446,9 +584,20 @@ def poll_source(source_id: str):
             except Exception as e:
                 logging.warning(f"Failed to generate transcript embeddings: {e}")
 
-    # Save items
+    # Save items and create attributions
     for item in new_items:
         state.store.upsert_item(item)
+
+        # Create attribution linking this item to the source
+        attribution = ItemAttribution(
+            id=uuid.uuid4().hex[:12],
+            item_id=item.id,
+            source_id=source_id,
+            external_id=item.external_id,
+            is_primary=True,  # First source is primary
+            discovered_at=datetime.utcnow(),
+        )
+        state.store.upsert_attribution(attribution)
 
     state.store.update_source_poll_time(source_id, datetime.utcnow())
 
@@ -488,6 +637,121 @@ def delete_source(source_id: str, keep_items: bool = Query(False, description="K
 
     items_deleted = state.store.delete_source(source_id, delete_items=not keep_items)
     return {"status": "deleted", "items_deleted": items_deleted}
+
+
+@app.get("/api/sources/{source_id}/stats", response_model=SourceStatsResponse)
+def get_source_stats(source_id: str):
+    """Get aggregated stats for a source."""
+    source = state.store.get_source(source_id)
+    if not source:
+        raise HTTPException(status_code=404, detail="Source not found")
+
+    stats = state.store.get_source_stats(source_id)
+    return SourceStatsResponse(
+        source_id=stats.source_id,
+        total_items=stats.total_items,
+        total_feedback_events=stats.total_feedback_events,
+        avg_reward_score=stats.avg_reward_score,
+        unique_creators=stats.unique_creators,
+    )
+
+
+# =============================================================================
+# Routes: Creators
+# =============================================================================
+
+
+@app.get("/api/creators", response_model=list[CreatorResponse])
+def list_creators(
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """List all creators."""
+    creators = state.store.list_creators(limit=limit, offset=offset)
+    result = []
+    for creator in creators:
+        stats = state.store.get_creator_stats(creator.id)
+        result.append(CreatorResponse(
+            id=creator.id,
+            name=creator.name,
+            creator_type=creator.creator_type.value,
+            avatar_url=creator.avatar_url,
+            bio=creator.bio,
+            url=creator.url,
+            item_count=stats.total_items,
+            avg_score=stats.avg_reward_score,
+        ))
+    return result
+
+
+@app.get("/api/creators/{creator_id}", response_model=CreatorResponse)
+def get_creator(creator_id: str):
+    """Get a creator by ID."""
+    creator = state.store.get_creator(creator_id)
+    if not creator:
+        raise HTTPException(status_code=404, detail="Creator not found")
+
+    stats = state.store.get_creator_stats(creator_id)
+    return CreatorResponse(
+        id=creator.id,
+        name=creator.name,
+        creator_type=creator.creator_type.value,
+        avatar_url=creator.avatar_url,
+        bio=creator.bio,
+        url=creator.url,
+        item_count=stats.total_items,
+        avg_score=stats.avg_reward_score,
+    )
+
+
+@app.get("/api/creators/{creator_id}/stats", response_model=CreatorStatsResponse)
+def get_creator_stats(creator_id: str):
+    """Get aggregated stats for a creator."""
+    creator = state.store.get_creator(creator_id)
+    if not creator:
+        raise HTTPException(status_code=404, detail="Creator not found")
+
+    stats = state.store.get_creator_stats(creator_id)
+    return CreatorStatsResponse(
+        creator_id=stats.creator_id,
+        total_items=stats.total_items,
+        total_feedback_events=stats.total_feedback_events,
+        avg_reward_score=stats.avg_reward_score,
+        content_types=stats.content_types,
+    )
+
+
+@app.get("/api/creators/{creator_id}/items", response_model=list[ItemResponse])
+def get_creator_items(
+    creator_id: str,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """Get items by a specific creator."""
+    creator = state.store.get_creator(creator_id)
+    if not creator:
+        raise HTTPException(status_code=404, detail="Creator not found")
+
+    items = state.store.get_items_by_creator(creator_id, limit=limit, offset=offset)
+    result = []
+    for item in items:
+        source = state.store.get_source(item.source_id)
+        result.append(ItemResponse(
+            id=item.id,
+            source_id=item.source_id,
+            source_name=source.display_name if source else "Unknown",
+            url=item.url,
+            title=item.title,
+            creator_id=item.creator_id,
+            creator_name=item.creator_name,
+            published_at=item.published_at,
+            content_type=item.content_type.value,
+            seen=item.seen,
+            hidden=item.hidden,
+            metadata=item.metadata,
+            canonical_ids=item.canonical_ids,
+        ))
+    return result
 
 
 # =============================================================================
@@ -632,6 +896,7 @@ def get_feed(
             source_name=sources_map.get(item.source_id, type("", (), {"display_name": "Unknown"})).display_name,
             url=item.url,
             title=item.title,
+            creator_id=item.creator_id,
             creator_name=item.creator_name,
             published_at=item.published_at,
             content_type=item.content_type.value,
@@ -679,6 +944,7 @@ def get_item(item_id: str):
         source_name=source.display_name if source else "Unknown",
         url=item.url,
         title=item.title,
+        creator_id=item.creator_id,
         creator_name=item.creator_name,
         published_at=item.published_at,
         content_type=item.content_type.value,

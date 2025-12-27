@@ -40,6 +40,15 @@ class ConsumptionType(Enum):
     SERIALIZED = "serialized"  # Part of a series (episode, chapter)
 
 
+class CreatorType(Enum):
+    """Type of content creator."""
+    INDIVIDUAL = "individual"  # Single person
+    COMPANY = "company"        # Business or organization
+    GROUP = "group"            # Band, collective, team
+    AI_AGENT = "ai_agent"      # AI-generated content
+    UNKNOWN = "unknown"        # Default when type is unclear
+
+
 @dataclass
 class Source:
     """A content source stored in the database."""
@@ -79,17 +88,55 @@ class Source:
 
 
 @dataclass
+class Creator:
+    """An individual, company, or agent that creates content.
+
+    Creators are deduplicated across sources using external_ids and name matching.
+    """
+    id: str
+    name: str                      # Display name (canonical)
+    creator_type: CreatorType = CreatorType.UNKNOWN
+
+    # Alternative names, spellings, aliases for matching
+    name_variants: list[str] = field(default_factory=list)
+
+    # External identifiers for deduplication across platforms
+    # Keys: "youtube", "twitter", "bandcamp", "spotify", "orcid", etc.
+    external_ids: dict[str, str] = field(default_factory=dict)
+
+    # Profile information
+    avatar_url: str | None = None
+    bio: str | None = None
+    url: str | None = None         # Personal website or primary link
+
+    # Extensible metadata
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    # Timestamps
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+
+
+@dataclass
 class Item:
-    """Normalized content item stored in database."""
+    """Normalized content item stored in database.
+
+    Conceptually, Item represents "Content" - a piece of content that can be
+    discovered from multiple sources and created by one or more creators.
+    """
     id: str                       # Internal UUID
     source_id: str                # Primary source (first discovered from)
     external_id: str              # Platform-specific ID (from primary source)
     url: str                      # May be empty for books/games without direct URL
     title: str
-    creator_name: str
     published_at: datetime
     ingested_at: datetime
     content_type: ContentType
+
+    # Creator reference (normalized)
+    creator_id: str | None = None  # FK to Creator entity
+    creator_name: str = ""         # Denormalized for display; deprecated for new code
+
     consumption_type: ConsumptionType = ConsumptionType.ONE_SHOT
 
     # Extensible metadata - common fields extracted, rest preserved
@@ -114,15 +161,21 @@ class Item:
 
 @dataclass
 class ItemAttribution:
-    """Tracks which sources recommended an item.
+    """Tracks which sources an item (content) was discovered from.
 
     Enables provenance: "This book was recommended by Hugo Awards, NYT Books, and @friend"
     An item can have multiple attributions from different sources.
+
+    Also known as "ContentSource" conceptually - links content to sources.
     """
     id: str
     item_id: str
     source_id: str
     discovered_at: datetime
+
+    # Provenance tracking
+    external_id: str = ""             # ID within this source (for dedup)
+    is_primary: bool = False          # Was this the first source we discovered from?
 
     # Optional context about the recommendation
     rank: int | None = None           # Position in list (1 = top)
@@ -183,3 +236,29 @@ class ExplicitFeedback:
     notes: str | None = None
     completion_pct: float | None = None  # where they were when rating
     is_checkpoint: bool = False          # periodic check-in vs final rating
+
+
+@dataclass
+class CreatorStats:
+    """Aggregated statistics for a creator, derived from content feedback."""
+    creator_id: str
+    total_items: int = 0
+    total_feedback_events: int = 0
+    avg_reward_score: float | None = None
+    total_time_spent_ms: float = 0.0
+
+    # Breakdown by content type
+    content_types: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class SourceStats:
+    """Aggregated statistics for a source, derived from content feedback."""
+    source_id: str
+    total_items: int = 0
+    total_feedback_events: int = 0
+    avg_reward_score: float | None = None
+    total_time_spent_ms: float = 0.0
+
+    # Unique creators whose content appears in this source
+    unique_creators: int = 0

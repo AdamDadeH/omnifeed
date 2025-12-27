@@ -6,7 +6,7 @@ from datetime import datetime
 from omnifeed.models import (
     Source, SourceInfo, Item, FeedbackEvent,
     FeedbackDimension, FeedbackOption, ExplicitFeedback,
-    ItemAttribution,
+    ItemAttribution, Creator, CreatorStats, SourceStats,
 )
 
 
@@ -47,6 +47,52 @@ class Store(ABC):
     @abstractmethod
     def delete_source(self, source_id: str, delete_items: bool = True) -> int:
         """Permanently delete a source and optionally its items."""
+        pass
+
+    @abstractmethod
+    def get_source_stats(self, source_id: str) -> SourceStats:
+        """Get aggregated stats for a source from content feedback."""
+        pass
+
+    # Creators
+    @abstractmethod
+    def add_creator(self, creator: Creator) -> Creator:
+        """Add a new creator. Returns the created Creator with ID."""
+        pass
+
+    @abstractmethod
+    def get_creator(self, creator_id: str) -> Creator | None:
+        """Get a creator by ID."""
+        pass
+
+    @abstractmethod
+    def get_creator_by_name(self, name: str) -> Creator | None:
+        """Find a creator by exact name match (case-insensitive)."""
+        pass
+
+    @abstractmethod
+    def find_creator_by_external_id(self, id_type: str, id_value: str) -> Creator | None:
+        """Find a creator by external ID (e.g., YouTube channel ID)."""
+        pass
+
+    @abstractmethod
+    def update_creator(self, creator: Creator) -> None:
+        """Update creator metadata."""
+        pass
+
+    @abstractmethod
+    def list_creators(self, limit: int = 100, offset: int = 0) -> list[Creator]:
+        """List all creators."""
+        pass
+
+    @abstractmethod
+    def get_creator_stats(self, creator_id: str) -> CreatorStats:
+        """Get aggregated stats for a creator from content feedback."""
+        pass
+
+    @abstractmethod
+    def get_items_by_creator(self, creator_id: str, limit: int = 50, offset: int = 0) -> list[Item]:
+        """Get items created by a specific creator."""
         pass
 
     # Items
@@ -202,6 +248,11 @@ class Store(ABC):
     @abstractmethod
     def get_items_by_source_attribution(self, source_id: str, limit: int = 50) -> list[Item]:
         """Get items attributed to a source (even if not the primary source)."""
+        pass
+
+    @abstractmethod
+    def upsert_attribution(self, attribution: ItemAttribution) -> None:
+        """Add or update an attribution (upsert by item_id + source_id)."""
         pass
 
     # Lifecycle

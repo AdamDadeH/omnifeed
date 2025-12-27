@@ -1,6 +1,17 @@
 import { formatDistanceToNow } from '../utils/time';
 import type { FeedItem as FeedItemType } from '../api/types';
 
+function formatDuration(seconds: number): string {
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = seconds % 60;
+
+  if (hours > 0) {
+    return `${hours}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  }
+  return `${minutes}:${secs.toString().padStart(2, '0')}`;
+}
+
 interface Props {
   item: FeedItemType;
   onOpen: () => void;
@@ -30,8 +41,29 @@ export function FeedItem({ item, onOpen, onMarkSeen, onHide }: Props) {
               {item.title}
             </button>
 
+            {/* Creator line */}
+            <div className="flex items-center gap-2 mt-1 text-sm">
+              <span className="text-neutral-400">{item.creator_name}</span>
+              {item.metadata.extracted_creators && item.metadata.extracted_creators.length > 0 && (
+                <span className="text-neutral-500">
+                  {item.metadata.extracted_creators.slice(0, 3).map((ec, idx) => (
+                    <span key={ec.creator_id}>
+                      {idx === 0 ? ' · ' : ', '}
+                      <span className="text-neutral-500">
+                        {ec.role === 'guest' ? 'w/' : ec.role === 'featuring' ? 'ft.' : `${ec.role}:`}
+                      </span>{' '}
+                      <span className="text-neutral-400">{ec.name}</span>
+                    </span>
+                  ))}
+                  {item.metadata.extracted_creators.length > 3 && (
+                    <span className="text-neutral-600"> +{item.metadata.extracted_creators.length - 3}</span>
+                  )}
+                </span>
+              )}
+            </div>
+
             {/* Meta line */}
-            <div className="flex items-center gap-2 mt-1 text-sm text-neutral-500">
+            <div className="flex items-center gap-2 mt-0.5 text-sm text-neutral-500">
               <span className="truncate max-w-[200px]">{item.source_name}</span>
               <span>·</span>
               <a
@@ -46,6 +78,12 @@ export function FeedItem({ item, onOpen, onMarkSeen, onHide }: Props) {
                 <>
                   <span>·</span>
                   <span className="capitalize">{item.content_type}</span>
+                </>
+              )}
+              {item.metadata.duration_seconds && item.metadata.duration_seconds > 0 && (
+                <>
+                  <span>·</span>
+                  <span>{formatDuration(item.metadata.duration_seconds)}</span>
                 </>
               )}
               {item.score !== null && (

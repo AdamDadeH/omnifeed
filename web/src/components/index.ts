@@ -5,4 +5,5 @@ export { AddSourceModal } from './AddSourceModal';
 export { ReaderPane } from './ReaderPane';
 export { StatsView } from './StatsView';
 export { SourcesView } from './SourcesView';
+export { CreatorsView } from './CreatorsView';
 export type { ReadingFeedback } from './ReaderPane';

@@ -38,7 +38,6 @@ export function ReaderPane({ item, onClose, onFeedback }: Props) {
 
   // Get the appropriate renderer for this item
   const rendererInfo = getRendererForItem(item);
-  const hasInlineRenderer = rendererInfo !== null;
 
   // Load dimensions and existing feedback on mount
   useEffect(() => {
@@ -266,8 +265,24 @@ export function ReaderPane({ item, onClose, onFeedback }: Props) {
       <header className="flex-shrink-0 px-4 py-3 border-b border-neutral-800 flex items-center justify-between bg-neutral-900">
         <div className="flex-1 min-w-0 mr-4">
           <h1 className="text-lg font-medium truncate">{item.title}</h1>
+          <div className="text-sm text-neutral-400">
+            {item.creator_name}
+            {item.metadata.extracted_creators && item.metadata.extracted_creators.length > 0 && (
+              <span className="text-neutral-500">
+                {item.metadata.extracted_creators.map((ec) => (
+                  <span key={ec.creator_id}>
+                    {' · '}
+                    <span className="text-neutral-500">
+                      {ec.role === 'guest' ? 'w/' : ec.role === 'featuring' ? 'ft.' : `${ec.role}:`}
+                    </span>{' '}
+                    <span className="text-neutral-400">{ec.name}</span>
+                  </span>
+                ))}
+              </span>
+            )}
+          </div>
           <div className="text-sm text-neutral-500">
-            {item.source_name} · {item.creator_name} · {formatDistanceToNow(item.published_at)}
+            {item.source_name} · {formatDistanceToNow(item.published_at)}
             {rendererInfo && (
               <span className="ml-2 px-1.5 py-0.5 bg-neutral-800 rounded text-xs">
                 {rendererInfo.name}

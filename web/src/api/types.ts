@@ -18,18 +18,31 @@ export interface SourcePreview {
   description: string | null;
 }
 
+export interface ExtractedCreator {
+  creator_id: string;
+  name: string;
+  role: string;
+  confidence: number;
+}
+
 export interface FeedItem {
   id: string;
   source_id: string;
   source_name: string;
   url: string;
   title: string;
+  creator_id: string | null;
   creator_name: string;
   published_at: string;
   content_type: string;
   seen: boolean;
   hidden: boolean;
-  metadata: Record<string, unknown>;
+  metadata: Record<string, unknown> & {
+    extracted_creators?: ExtractedCreator[];
+    thumbnail?: string;
+    content_text?: string;
+    duration_seconds?: number;
+  };
   score: number | null;
 }
 
@@ -124,6 +137,35 @@ export interface ExplicitFeedbackPayload {
   notes?: string;
   completion_pct?: number;
   is_checkpoint?: boolean;
+}
+
+// Creator types
+
+export interface Creator {
+  id: string;
+  name: string;
+  creator_type: string;
+  avatar_url: string | null;
+  bio: string | null;
+  url: string | null;
+  item_count: number;
+  avg_score: number | null;
+}
+
+export interface CreatorStats {
+  creator_id: string;
+  total_items: number;
+  total_feedback_events: number;
+  avg_reward_score: number | null;
+  content_types: Record<string, number>;
+}
+
+export interface SourceStats {
+  source_id: string;
+  total_items: number;
+  total_feedback_events: number;
+  avg_reward_score: number | null;
+  unique_creators: number;
 }
 
 // Model status and training

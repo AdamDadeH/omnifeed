@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from 'react';
-import { Sidebar, FeedList, AddSourceModal, ReaderPane, StatsView, SourcesView } from './components';
+import { Sidebar, FeedList, AddSourceModal, ReaderPane, StatsView, SourcesView, CreatorsView } from './components';
 import type { ReadingFeedback } from './components';
 import type { FeedItem } from './api/types';
 import { markSeen, recordFeedback, pollSource, pollAllSources, getObjectives } from './api/client';
@@ -11,6 +11,7 @@ function App() {
   const [showSeen, setShowSeen] = useState(false);
   const [showStats, setShowStats] = useState(false);
   const [showSources, setShowSources] = useState(false);
+  const [showCreators, setShowCreators] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
   const [readingItem, setReadingItem] = useState<FeedItem | null>(null);
   const [polling, setPolling] = useState(false);
@@ -87,12 +88,48 @@ function App() {
 
       {/* Main content */}
       <main className="flex-1 flex flex-col overflow-hidden">
-        {/* Header */}
-        <header className="px-4 py-3 border-b border-neutral-800 flex items-center justify-between">
-          <h2 className="text-lg font-medium">
-            {selectedSource ? 'Source Feed' : 'All Items'}
-          </h2>
+        {/* Header - Row 1: View selectors */}
+        <header className="px-4 pt-3 pb-2 border-b border-neutral-800">
+          <div className="flex items-center justify-between mb-2">
+            <h2 className="text-lg font-medium">
+              {selectedSource ? 'Source Feed' : 'All Items'}
+            </h2>
 
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setShowCreators(true)}
+                className="px-3 py-1.5 text-sm bg-neutral-800 hover:bg-neutral-700 rounded transition-colors"
+              >
+                Creators
+              </button>
+
+              <button
+                onClick={() => setShowSources(true)}
+                className="px-3 py-1.5 text-sm bg-neutral-800 hover:bg-neutral-700 rounded transition-colors"
+              >
+                Sources
+              </button>
+
+              <button
+                onClick={() => setShowStats(true)}
+                className="px-3 py-1.5 text-sm bg-neutral-800 hover:bg-neutral-700 rounded transition-colors"
+              >
+                Models
+              </button>
+
+              <div className="w-px h-6 bg-neutral-700 mx-1" />
+
+              <button
+                onClick={handlePoll}
+                disabled={polling}
+                className="px-3 py-1.5 text-sm bg-neutral-800 hover:bg-neutral-700 disabled:opacity-50 rounded transition-colors"
+              >
+                {polling ? 'Refreshing...' : selectedSource ? 'Refresh Source' : 'Refresh All'}
+              </button>
+            </div>
+          </div>
+
+          {/* Row 2: Filters */}
           <div className="flex items-center gap-4">
             {/* Objective selector */}
             {objectives.length > 0 && (
@@ -119,28 +156,6 @@ function App() {
               />
               Show read
             </label>
-
-            <button
-              onClick={() => setShowSources(true)}
-              className="px-3 py-1.5 text-sm bg-neutral-800 hover:bg-neutral-700 rounded transition-colors"
-            >
-              Sources
-            </button>
-
-            <button
-              onClick={() => setShowStats(true)}
-              className="px-3 py-1.5 text-sm bg-neutral-800 hover:bg-neutral-700 rounded transition-colors"
-            >
-              Stats
-            </button>
-
-            <button
-              onClick={handlePoll}
-              disabled={polling}
-              className="px-3 py-1.5 text-sm bg-neutral-800 hover:bg-neutral-700 disabled:opacity-50 rounded transition-colors"
-            >
-              {polling ? 'Refreshing...' : selectedSource ? 'Refresh Source' : 'Refresh All'}
-            </button>
           </div>
         </header>
 
@@ -181,6 +196,11 @@ function App() {
       {/* Sources view */}
       {showSources && (
         <SourcesView onClose={() => setShowSources(false)} onRefresh={handleRefresh} />
+      )}
+
+      {/* Creators view */}
+      {showCreators && (
+        <CreatorsView onClose={() => setShowCreators(false)} />
       )}
     </div>
   );
