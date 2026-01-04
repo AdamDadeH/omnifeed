@@ -2,11 +2,11 @@
 
 from abc import ABC, abstractmethod
 
-from omnifeed.models import Item
+from omnifeed.models import Content
 
 
 class FeatureExtractor(ABC):
-    """Interface for extracting ranking features from an item."""
+    """Interface for extracting ranking features from content."""
 
     @property
     @abstractmethod
@@ -15,8 +15,8 @@ class FeatureExtractor(ABC):
         pass
 
     @abstractmethod
-    def extract(self, item: Item) -> dict[str, float]:
-        """Extract feature(s) from item.
+    def extract(self, content: Content) -> dict[str, float]:
+        """Extract feature(s) from content.
 
         Returns:
             Dictionary mapping feature names to values.

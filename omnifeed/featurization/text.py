@@ -1,4 +1,4 @@
-"""Embedding generation for content items."""
+"""Text embedding generation using sentence-transformers."""
 
 from typing import Protocol, Any
 import logging
@@ -8,7 +8,6 @@ from omnifeed.models import Item
 logger = logging.getLogger(__name__)
 
 
-# Embedding entry structure
 def make_embedding(
     embedding_type: str,
     model: str,
@@ -83,7 +82,13 @@ class SentenceTransformerEmbedder:
 
 
 class EmbeddingService:
-    """Service for generating embeddings for items."""
+    """Service for generating embeddings for items.
+
+    Uses content_text from item metadata if available, falling back to
+    title + description. This allows any source adapter to provide rich
+    text content (transcripts, article body, etc.) without the embedding
+    service needing to know about specific platforms.
+    """
 
     DEFAULT_TEXT_MODEL = "all-MiniLM-L6-v2"
 
@@ -91,19 +96,26 @@ class EmbeddingService:
         self.model = model or SentenceTransformerEmbedder()
 
     def get_item_text(self, item: Item) -> str:
-        """Extract text content from item for embedding."""
+        """Extract text content from item for embedding.
+
+        Priority:
+        1. content_text from metadata (transcript, article body, etc.)
+        2. description from metadata
+        3. title + creator name
+        """
         parts = [item.title]
 
         # Add creator name
         if item.creator_name:
             parts.append(f"by {item.creator_name}")
 
-        # Add description/content if available
+        # Add content_text if available (transcript, article body, etc.)
         content_text = item.metadata.get("content_text")
         if content_text and isinstance(content_text, str):
             # Truncate to avoid too long texts
             parts.append(content_text[:1000])
 
+        # Fall back to description if no content_text
         description = item.metadata.get("description")
         if description and isinstance(description, str) and not content_text:
             parts.append(description[:500])

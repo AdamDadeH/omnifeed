@@ -1,6 +1,6 @@
 """Registry for feature extractors."""
 
-from omnifeed.models import Item
+from omnifeed.models import Content
 from omnifeed.ranking.base import FeatureExtractor
 
 
@@ -14,11 +14,11 @@ class FeatureRegistry:
         """Register a feature extractor."""
         self._extractors.append(extractor)
 
-    def extract_all(self, item: Item) -> dict[str, float]:
+    def extract_all(self, content: Content) -> dict[str, float]:
         """Run all extractors, return combined feature dict."""
         features: dict[str, float] = {}
         for ext in self._extractors:
-            features.update(ext.extract(item))
+            features.update(ext.extract(content))
         return features
 
     def list_extractors(self) -> list[FeatureExtractor]:

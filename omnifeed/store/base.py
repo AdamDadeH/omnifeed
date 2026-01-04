@@ -7,8 +7,9 @@ from omnifeed.models import (
     Source, SourceInfo, Item, FeedbackEvent,
     FeedbackDimension, FeedbackOption, ExplicitFeedback,
     ItemAttribution, Creator, CreatorStats, SourceStats,
-    Platform, DiscoverySource, DiscoverySignal, PlatformInstance,
+    DiscoverySignal, Content, Encoding,
 )
+from omnifeed.retriever.types import Retriever, RetrieverScore
 
 
 class Store(ABC):
@@ -159,6 +160,110 @@ class Store(ABC):
         """Count items matching the filters."""
         pass
 
+    # Content (new model - abstract content independent of access method)
+    @abstractmethod
+    def upsert_content(self, content: Content) -> None:
+        """Insert or update content by ID."""
+        pass
+
+    @abstractmethod
+    def get_content(self, content_id: str) -> Content | None:
+        """Get content by ID."""
+        pass
+
+    @abstractmethod
+    def get_contents(
+        self,
+        seen: bool | None = None,
+        hidden: bool | None = None,
+        source_type: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[Content]:
+        """Get content with optional filters.
+
+        Args:
+            seen: Filter by seen status
+            hidden: Filter by hidden status
+            source_type: Filter by encoding source type (joins with encodings table)
+            limit: Max results
+            offset: Pagination offset
+        """
+        pass
+
+    @abstractmethod
+    def get_content_by_canonical_id(self, id_type: str, id_value: str) -> Content | None:
+        """Find content by canonical ID (ISBN, IMDB, etc.)."""
+        pass
+
+    @abstractmethod
+    def find_content_by_canonical_ids(self, canonical_ids: dict[str, str]) -> Content | None:
+        """Find existing content that matches any of the provided canonical IDs."""
+        pass
+
+    @abstractmethod
+    def mark_content_seen(self, content_id: str, seen: bool = True) -> None:
+        """Mark content as seen or unseen."""
+        pass
+
+    @abstractmethod
+    def mark_content_hidden(self, content_id: str, hidden: bool = True) -> None:
+        """Mark content as hidden or unhidden."""
+        pass
+
+    @abstractmethod
+    def count_content(
+        self,
+        seen: bool | None = None,
+        hidden: bool | None = None,
+    ) -> int:
+        """Count content matching the filters."""
+        pass
+
+    # Encodings (how to access content - URLs, deep links, etc.)
+    @abstractmethod
+    def add_encoding(self, encoding: Encoding) -> None:
+        """Add a new encoding for content."""
+        pass
+
+    @abstractmethod
+    def get_encoding(self, encoding_id: str) -> Encoding | None:
+        """Get an encoding by ID."""
+        pass
+
+    @abstractmethod
+    def get_encoding_by_external_id(self, source_type: str, external_id: str) -> Encoding | None:
+        """Get an encoding by source type and external ID."""
+        pass
+
+    @abstractmethod
+    def get_encoding_by_uri(self, uri: str) -> Encoding | None:
+        """Get an encoding by URI (URL or deep link)."""
+        pass
+
+    @abstractmethod
+    def get_encodings_for_content(self, content_id: str) -> list[Encoding]:
+        """Get all encodings for a piece of content."""
+        pass
+
+    @abstractmethod
+    def get_primary_encoding(self, content_id: str) -> Encoding | None:
+        """Get the primary (first discovered) encoding for content."""
+        pass
+
+    # Convenience methods for Content + Encoding
+    @abstractmethod
+    def get_content_with_encodings(
+        self, content_id: str
+    ) -> tuple[Content, list[Encoding]] | None:
+        """Get content along with all its encodings."""
+        pass
+
+    @abstractmethod
+    def migrate_items_to_content(self) -> int:
+        """Migrate existing Item records to Content + Encoding. Returns count migrated."""
+        pass
+
     # Feedback events
     @abstractmethod
     def add_feedback_event(self, event: FeedbackEvent) -> None:
@@ -256,50 +361,6 @@ class Store(ABC):
         """Add or update an attribution (upsert by item_id + source_id)."""
         pass
 
-    # Platforms
-    @abstractmethod
-    def add_platform(self, platform: Platform) -> Platform:
-        """Add a new platform. Returns the created Platform."""
-        pass
-
-    @abstractmethod
-    def get_platform(self, platform_id: str) -> Platform | None:
-        """Get a platform by ID."""
-        pass
-
-    @abstractmethod
-    def get_platform_by_url(self, url: str) -> Platform | None:
-        """Find a platform that matches the given URL pattern."""
-        pass
-
-    @abstractmethod
-    def list_platforms(self) -> list[Platform]:
-        """List all platforms."""
-        pass
-
-    # Discovery sources
-    @abstractmethod
-    def add_discovery_source(self, source: DiscoverySource) -> DiscoverySource:
-        """Add a new discovery source. Returns the created DiscoverySource."""
-        pass
-
-    @abstractmethod
-    def get_discovery_source(self, source_id: str) -> DiscoverySource | None:
-        """Get a discovery source by ID."""
-        pass
-
-    @abstractmethod
-    def list_discovery_sources(self) -> list[DiscoverySource]:
-        """List all discovery sources."""
-        pass
-
-    @abstractmethod
-    def update_discovery_source_poll_time(
-        self, source_id: str, polled_at: datetime
-    ) -> None:
-        """Update the last polled timestamp for a discovery source."""
-        pass
-
     # Discovery signals
     @abstractmethod
     def add_discovery_signal(self, signal: DiscoverySignal) -> DiscoverySignal:
@@ -326,26 +387,67 @@ class Store(ABC):
         """Link a discovery signal to a resolved item."""
         pass
 
-    # Platform instances
+    # Retrievers
     @abstractmethod
-    def add_platform_instance(self, instance: PlatformInstance) -> PlatformInstance:
-        """Add a platform instance for content. Returns the created instance."""
+    def add_retriever(self, retriever: Retriever) -> Retriever:
+        """Add a new retriever. Returns the created Retriever with ID."""
         pass
 
     @abstractmethod
-    def get_platform_instances(
+    def get_retriever(self, retriever_id: str) -> Retriever | None:
+        """Get a retriever by ID."""
+        pass
+
+    @abstractmethod
+    def get_retriever_by_uri(self, uri: str) -> Retriever | None:
+        """Get a retriever by its URI."""
+        pass
+
+    @abstractmethod
+    def list_retrievers(
         self,
-        item_id: str | None = None,
-        platform_id: str | None = None,
-    ) -> list[PlatformInstance]:
-        """Get platform instances with optional filters."""
+        parent_id: str | None = None,
+        kind: str | None = None,
+        enabled_only: bool = True,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[Retriever]:
+        """List retrievers with optional filters."""
         pass
 
     @abstractmethod
-    def get_platform_instance(
-        self, item_id: str, platform_id: str
-    ) -> PlatformInstance | None:
-        """Get a specific platform instance for an item on a platform."""
+    def get_children(self, parent_id: str) -> list[Retriever]:
+        """Get child retrievers of a parent."""
+        pass
+
+    @abstractmethod
+    def update_retriever(self, retriever: Retriever) -> None:
+        """Update retriever metadata and config."""
+        pass
+
+    @abstractmethod
+    def update_retriever_invoked(self, retriever_id: str, invoked_at: datetime) -> None:
+        """Update the last_invoked_at timestamp."""
+        pass
+
+    @abstractmethod
+    def update_retriever_score(self, retriever_id: str, score: RetrieverScore) -> None:
+        """Update a retriever's quality score."""
+        pass
+
+    @abstractmethod
+    def enable_retriever(self, retriever_id: str, enabled: bool = True) -> None:
+        """Enable or disable a retriever."""
+        pass
+
+    @abstractmethod
+    def delete_retriever(self, retriever_id: str, delete_children: bool = True) -> int:
+        """Delete a retriever and optionally its children. Returns count deleted."""
+        pass
+
+    @abstractmethod
+    def get_retrievers_needing_poll(self, limit: int = 10) -> list[Retriever]:
+        """Get POLL retrievers that are due for polling."""
         pass
 
     # Lifecycle

@@ -12,14 +12,26 @@ function formatDuration(seconds: number): string {
   return `${minutes}:${secs.toString().padStart(2, '0')}`;
 }
 
+interface ActionButton {
+  label: string;
+  onClick: () => void;
+  variant?: 'default' | 'primary' | 'danger' | 'success';
+  disabled?: boolean;
+}
+
 interface Props {
   item: FeedItemType;
   onOpen: () => void;
-  onMarkSeen: (id: string) => void;
-  onHide: (id: string) => void;
+  /** Custom actions to show. If not provided, uses default feed actions */
+  actions?: ActionButton[];
+  /** Default action callbacks (used when actions prop not provided) */
+  onMarkSeen?: (id: string) => void;
+  onHide?: (id: string) => void;
+  /** Show saved state indicator */
+  isSaved?: boolean;
 }
 
-export function FeedItem({ item, onOpen, onMarkSeen, onHide }: Props) {
+export function FeedItem({ item, onOpen, actions, onMarkSeen, onHide, isSaved }: Props) {
   const handleClick = () => {
     onOpen();
   };
@@ -28,7 +40,7 @@ export function FeedItem({ item, onOpen, onMarkSeen, onHide }: Props) {
     <div
       className={`group border-b border-neutral-800 hover:bg-neutral-900 transition-colors ${
         item.seen ? 'opacity-60' : ''
-      }`}
+      } ${isSaved ? 'border-l-2 border-l-green-600' : ''}`}
     >
       <div className="px-4 py-3">
         <div className="flex items-start gap-3">
@@ -124,21 +136,56 @@ export function FeedItem({ item, onOpen, onMarkSeen, onHide }: Props) {
         </div>
 
         {/* Actions - show on hover */}
-        <div className="flex gap-2 mt-2 opacity-0 group-hover:opacity-100 transition-opacity">
-          {!item.seen && (
-            <button
-              onClick={() => onMarkSeen(item.id)}
-              className="text-xs text-neutral-500 hover:text-neutral-300 transition-colors"
-            >
-              Mark read
-            </button>
+        <div className="flex items-center gap-2 mt-2 opacity-0 group-hover:opacity-100 transition-opacity">
+          {isSaved && (
+            <span className="text-xs text-green-400 flex items-center gap-1">
+              <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
+                <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
+              </svg>
+              Saved
+            </span>
           )}
-          <button
-            onClick={() => onHide(item.id)}
-            className="text-xs text-neutral-500 hover:text-red-400 transition-colors"
-          >
-            Hide
-          </button>
+          {actions ? (
+            // Custom actions
+            actions.map((action, idx) => (
+              <button
+                key={idx}
+                onClick={action.onClick}
+                disabled={action.disabled}
+                className={`text-xs transition-colors ${
+                  action.variant === 'primary'
+                    ? 'text-blue-400 hover:text-blue-300'
+                    : action.variant === 'danger'
+                    ? 'text-red-400 hover:text-red-300'
+                    : action.variant === 'success'
+                    ? 'text-green-400 hover:text-green-300'
+                    : 'text-neutral-500 hover:text-neutral-300'
+                } disabled:opacity-50`}
+              >
+                {action.label}
+              </button>
+            ))
+          ) : (
+            // Default feed actions
+            <>
+              {!item.seen && onMarkSeen && (
+                <button
+                  onClick={() => onMarkSeen(item.id)}
+                  className="text-xs text-neutral-500 hover:text-neutral-300 transition-colors"
+                >
+                  Mark read
+                </button>
+              )}
+              {onHide && (
+                <button
+                  onClick={() => onHide(item.id)}
+                  className="text-xs text-neutral-500 hover:text-red-400 transition-colors"
+                >
+                  Hide
+                </button>
+              )}
+            </>
+          )}
         </div>
       </div>
     </div>

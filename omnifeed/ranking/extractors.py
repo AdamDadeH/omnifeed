@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from omnifeed.models import Item
+from omnifeed.models import Content
 from omnifeed.ranking.base import FeatureExtractor
 
 
@@ -13,9 +13,9 @@ class FreshnessExtractor(FeatureExtractor):
     def name(self) -> str:
         return "freshness"
 
-    def extract(self, item: Item) -> dict[str, float]:
+    def extract(self, content: Content) -> dict[str, float]:
         """Extract age in hours as a feature."""
-        age_seconds = (datetime.utcnow() - item.published_at).total_seconds()
+        age_seconds = (datetime.utcnow() - content.published_at).total_seconds()
         age_hours = age_seconds / 3600
 
         return {
@@ -31,7 +31,7 @@ class ContentTypeExtractor(FeatureExtractor):
     def name(self) -> str:
         return "content_type"
 
-    def extract(self, item: Item) -> dict[str, float]:
+    def extract(self, content: Content) -> dict[str, float]:
         """Return one-hot encoding of content type."""
         features = {
             "is_video": 0.0,
@@ -40,7 +40,7 @@ class ContentTypeExtractor(FeatureExtractor):
             "is_paper": 0.0,
         }
 
-        key = f"is_{item.content_type.value}"
+        key = f"is_{content.content_type.value}"
         if key in features:
             features[key] = 1.0
 

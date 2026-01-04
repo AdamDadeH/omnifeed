@@ -34,6 +34,8 @@ class QobuzSearchProvider(SearchProvider):
             return []
 
         params = {"app_id": self.credentials["app_id"], "query": query, "limit": limit}
+        if self.credentials.get("user_token"):
+            params["user_auth_token"] = self.credentials["user_token"]
 
         async with httpx.AsyncClient() as client:
             response = await client.get(
@@ -53,7 +55,7 @@ class QobuzSearchProvider(SearchProvider):
                 artist_id = artist.get("id")
                 name = artist.get("name", "")
 
-                image = artist.get("image", {})
+                image = artist.get("image") or {}
                 thumbnail = image.get("large") or image.get("medium") or image.get("small")
 
                 albums_count = artist.get("albums_count", 0)

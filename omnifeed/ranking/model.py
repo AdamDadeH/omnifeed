@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from omnifeed.models import Item, ExplicitFeedback
-from omnifeed.ranking.embeddings import get_embedding_by_type
+from omnifeed.models import Content, ExplicitFeedback
+from omnifeed.featurization import get_embedding_by_type
 from omnifeed.store.base import Store
 
 logger = logging.getLogger(__name__)
@@ -414,91 +414,72 @@ class RankingModel:
 
         return features
 
-    def predict(self, item: Item) -> tuple[float, float]:
-        """Predict click probability and expected reward for an item.
+    def predict(self, content: Content) -> tuple[float, float]:
+        """Predict click probability and expected reward for content.
 
         Returns:
             (click_prob, expected_reward)
         """
-        # Check if model is trained and item has embeddings
-        if not self.is_trained or not item.embeddings:
-            # Return defaults for cold start
-            source = self.source_stats.get(item.source_id)
-            default_reward = source.avg_reward if source else 2.5
-            return 0.5, default_reward
+        # Check if model is trained and content has embeddings
+        if not self.is_trained or not content.embeddings:
+            return 0.5, 2.5
 
         try:
             import numpy as np
         except ImportError:
             return 0.5, 2.5
 
-        # Collect all embeddings from the item
+        # Collect all embeddings (handle both Embedding objects and dicts)
         embeddings_by_type = {}
-        for emb_entry in item.embeddings:
-            emb_type = emb_entry.get("type")
-            emb_vector = emb_entry.get("vector")
+        for emb in content.embeddings:
+            emb_type = emb.get("type") if isinstance(emb, dict) else emb.type
+            emb_vector = emb.get("vector") if isinstance(emb, dict) else emb.vector
             if emb_type and emb_vector:
                 embeddings_by_type[emb_type] = emb_vector
 
         if not embeddings_by_type:
-            source = self.source_stats.get(item.source_id)
-            default_reward = source.avg_reward if source else 2.5
-            return 0.5, default_reward
+            return 0.5, 2.5
 
-        # Build features using fusion layer
+        # Build features
         ex = TrainingExample(
-            item_id=item.id,
+            item_id=content.id,
             embeddings_by_type=embeddings_by_type,
-            source_id=item.source_id,
+            source_id="",  # Content doesn't have source_id
             clicked=False,
             reward_score=None,
-            content_type=item.content_type.value,
-            has_thumbnail=bool(item.metadata.get("thumbnail")),
-            title_length=len(item.title),
+            content_type=content.content_type.value,
+            has_thumbnail=bool(content.metadata.get("thumbnail")),
+            title_length=len(content.title),
         )
         features = self._build_features(ex)
         X = np.array([features])
         X_scaled = self.scaler.transform(X)
 
-        # Predict
+        # Predict click probability
         if self.click_model is not None:
             click_prob = self.click_model.predict_proba(X_scaled)[0, 1]
         else:
-            click_prob = 0.5  # Default when no click model
+            click_prob = 0.5
 
+        # Predict reward
         if self.reward_model is not None:
-            # Check for out-of-distribution features (scaled values too extreme)
             max_abs_scaled = np.abs(X_scaled).max()
             if max_abs_scaled > 10:
-                # Features are way outside training distribution, use source prior
-                source = self.source_stats.get(item.source_id)
-                expected_reward = source.avg_reward if source else 2.5
+                expected_reward = 2.5
             else:
                 expected_reward = float(self.reward_model.predict(X_scaled)[0])
-                expected_reward = max(0.0, min(5.0, expected_reward))  # Clamp
+                expected_reward = max(0.0, min(5.0, expected_reward))
         else:
-            source = self.source_stats.get(item.source_id)
-            expected_reward = source.avg_reward if source else 2.5
+            expected_reward = 2.5
 
         return float(click_prob), expected_reward
 
-    def score(self, item: Item, objective: str | None = None) -> float:
-        """Compute a single ranking score for an item.
+    def score(self, content: Content, objective: str | None = None) -> float:
+        """Compute a single ranking score for content."""
+        click_prob, expected_reward = self.predict(content)
 
-        Args:
-            item: The item to score
-            objective: Ignored by this model (for interface compatibility)
-
-        When click model exists: score = click_prob * expected_reward
-        Otherwise: score = expected_reward (use reward directly)
-        """
-        click_prob, expected_reward = self.predict(item)
-
-        # If we have a trained click model, use expected value formula
         if self.click_model is not None:
             return click_prob * expected_reward
-
-        # Otherwise just use expected reward (all examples are engaged anyway)
         return expected_reward
 
     def save(self, path: Path) -> None:

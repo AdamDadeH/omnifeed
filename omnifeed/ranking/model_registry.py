@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, Any, Callable
 
-from omnifeed.models import Item
+from omnifeed.models import Content
 from omnifeed.store.base import Store
 
 logger = logging.getLogger(__name__)
@@ -20,8 +20,8 @@ class RankerProtocol(Protocol):
 
     is_trained: bool
 
-    def score(self, item: Item, objective: str | None = None) -> float:
-        """Score an item. Higher = better."""
+    def score(self, content: Content, objective: str | None = None) -> float:
+        """Score content. Higher = better."""
         ...
 
     def train(self, store: Store) -> dict[str, Any]:

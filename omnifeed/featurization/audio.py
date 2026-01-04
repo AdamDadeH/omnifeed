@@ -6,13 +6,12 @@ CLAP embeds audio and text into the same latent space, enabling:
 - Cross-modal search (describe what you want, find matching audio)
 """
 
-import io
 import logging
 import tempfile
 from pathlib import Path
 from typing import Protocol
 
-import httpx
+from omnifeed.featurization.text import make_embedding
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +80,7 @@ class CLAPEmbedder:
 
         # Process audio
         inputs = processor(
-            audios=audio,
+            audio=audio,
             sampling_rate=sr,
             return_tensors="pt",
         )
@@ -98,6 +97,8 @@ class CLAPEmbedder:
 
     def embed_audio_url(self, url: str) -> list[float]:
         """Download audio from URL and embed it."""
+        import httpx
+
         # Download audio to temp file
         try:
             response = httpx.get(url, follow_redirects=True, timeout=60.0)
@@ -154,7 +155,6 @@ class AudioEmbeddingService:
 
     def embed_from_url(self, audio_url: str) -> dict | None:
         """Generate embedding from audio URL."""
-        from omnifeed.ranking.embeddings import make_embedding
         try:
             vector = self.model.embed_audio_url(audio_url)
             return make_embedding(
@@ -169,7 +169,6 @@ class AudioEmbeddingService:
 
     def embed_from_file(self, audio_path: str) -> dict | None:
         """Generate embedding from local audio file."""
-        from omnifeed.ranking.embeddings import make_embedding
         try:
             vector = self.model.embed_audio(audio_path)
             return make_embedding(
@@ -184,7 +183,6 @@ class AudioEmbeddingService:
 
     def embed_description(self, text: str) -> dict | None:
         """Generate embedding from text description (for cross-modal search)."""
-        from omnifeed.ranking.embeddings import make_embedding
         try:
             vector = self.model.embed_text(text)
             return make_embedding(

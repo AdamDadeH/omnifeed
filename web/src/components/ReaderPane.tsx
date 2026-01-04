@@ -161,7 +161,7 @@ export function ReaderPane({ item, onClose, onFeedback }: Props) {
   // Feedback prompt modal
   if (showFeedbackPrompt) {
     return (
-      <div className="fixed inset-0 bg-neutral-950 z-50 flex items-center justify-center">
+      <div className="fixed inset-0 bg-neutral-950 z-[60] flex items-center justify-center">
         <div className="bg-neutral-900 rounded-lg w-full max-w-lg p-6">
           <h2 className="text-lg font-medium mb-4">
             {existingFeedback ? 'Update your rating' : 'Rate this content'}
@@ -260,7 +260,7 @@ export function ReaderPane({ item, onClose, onFeedback }: Props) {
   const ContentRenderer = rendererInfo?.component;
 
   return (
-    <div className="fixed inset-0 bg-neutral-950 z-50 flex flex-col">
+    <div className="fixed inset-0 bg-neutral-950 z-[60] flex flex-col">
       {/* Header */}
       <header className="flex-shrink-0 px-4 py-3 border-b border-neutral-800 flex items-center justify-between bg-neutral-900">
         <div className="flex-1 min-w-0 mr-4">

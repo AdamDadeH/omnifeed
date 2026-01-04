@@ -1,14 +1,13 @@
-"""Ranking pipeline for scoring and ordering items."""
+"""Ranking pipeline for scoring and ordering content."""
 
 import logging
 import time
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from omnifeed.models import Item
-from omnifeed.ranking.embeddings import get_embedding_by_type
+from omnifeed.models import Content
+from omnifeed.featurization import get_embedding_by_type
 from omnifeed.ranking.registry import FeatureRegistry
 from omnifeed.ranking.model_registry import get_model_registry
 
@@ -16,6 +15,29 @@ if TYPE_CHECKING:
     from omnifeed.store import Store
 
 logger = logging.getLogger(__name__)
+
+
+def _get_embeddings(content: Content) -> list[dict]:
+    """Get embeddings from Content as dicts.
+
+    Handles both Embedding objects and legacy dict format.
+    """
+    result = []
+    for e in content.embeddings:
+        if isinstance(e, dict):
+            result.append(e)
+        else:
+            result.append({"name": e.name, "type": e.type, "vector": e.vector, "model": e.model})
+    return result
+
+
+def _get_source_key(content: Content, store: "Store" = None) -> str:
+    """Get a source identifier for diversity calculation."""
+    if store:
+        encoding = store.get_primary_encoding(content.id)
+        if encoding:
+            return encoding.source_type
+    return content.id
 
 
 # =============================================================================
@@ -30,58 +52,30 @@ class RetrievalStats:
     retrieval_time_ms: float
 
 
-class Retriever(ABC):
-    """Base class for candidate retrieval."""
-
-    @abstractmethod
-    def retrieve(
-        self,
-        store: "Store",
-        seen: bool | None = None,
-        hidden: bool = False,
-        source_id: str | None = None,
-        limit: int | None = None,
-    ) -> tuple[list[Item], RetrievalStats]:
-        """Retrieve candidate items for ranking.
-
-        Args:
-            store: Data store
-            seen: Filter by seen status (None = all)
-            hidden: Filter by hidden status
-            source_id: Filter by source
-            limit: Max candidates to retrieve (None = all)
-
-        Returns:
-            (items, stats)
-        """
-        pass
-
-
-class AllRetriever(Retriever):
-    """Retrieves ALL matching items. Simple but doesn't scale."""
+class ContentRetriever:
+    """Retrieves Content from the store."""
 
     def retrieve(
         self,
         store: "Store",
         seen: bool | None = None,
         hidden: bool = False,
-        source_id: str | None = None,
+        source_type: str | None = None,
         limit: int | None = None,
-    ) -> tuple[list[Item], RetrievalStats]:
+    ) -> tuple[list[Content], RetrievalStats]:
         t0 = time.perf_counter()
 
-        # Fetch all matching items
-        items = store.get_items(
+        contents = store.get_contents(
             seen=seen,
             hidden=hidden,
-            source_id=source_id,
-            limit=limit or 100000,  # Effectively unlimited
+            source_type=source_type,
+            limit=limit or 100000,
         )
 
         elapsed_ms = (time.perf_counter() - t0) * 1000
 
-        return items, RetrievalStats(
-            candidates=len(items),
+        return contents, RetrievalStats(
+            candidates=len(contents),
             retrieval_time_ms=round(elapsed_ms, 2),
         )
 
@@ -115,48 +109,44 @@ class RankingPipeline:
     def __init__(
         self,
         feature_registry: FeatureRegistry | None = None,
-        retriever: Retriever | None = None,
+        retriever: ContentRetriever | None = None,
         use_ml_model: bool = True,
     ):
         self.feature_registry = feature_registry or FeatureRegistry()
-        self.retriever = retriever or AllRetriever()
+        self.retriever = retriever or ContentRetriever()
         self.use_ml_model = use_ml_model
 
-    def score(self, item: Item, objective: str | None = None) -> float:
-        """Score a single item.
+    def score(self, content: Content, objective: str | None = None) -> float:
+        """Score content.
 
         Args:
-            item: The item to score
+            content: The content to score
             objective: Optional objective to optimize for (entertainment, curiosity, etc.)
-                      Registry maps objectives to appropriate models.
-
-        Uses ML model if trained, otherwise falls back to recency.
         """
         if not self.use_ml_model:
-            return self._recency_score(item)
+            return self._recency_score(content)
 
-        # Get model from registry (handles objective -> model mapping)
         registry = get_model_registry()
         model, model_name = registry.get_model_for_objective(objective)
 
-        if model and model.is_trained and get_embedding_by_type(item.embeddings, "text"):
+        embeddings = _get_embeddings(content)
+
+        if model and model.is_trained and get_embedding_by_type(embeddings, "text"):
             try:
-                return model.score(item, objective=objective)
+                return model.score(content, objective=objective)
             except Exception as e:
                 logger.warning(f"ML scoring failed ({model_name}): {e}")
 
-        # Fallback: recency-based scoring
-        return self._recency_score(item)
+        return self._recency_score(content)
 
-    def _recency_score(self, item: Item) -> float:
+    def _recency_score(self, content: Content) -> float:
         """Compute recency-based score."""
-        age_seconds = (datetime.utcnow() - item.published_at).total_seconds()
-        # Normalize to roughly 0-5 range (1 day old = ~2.5)
+        age_seconds = (datetime.utcnow() - content.published_at).total_seconds()
         return max(0, 5 - (age_seconds / 86400))
 
-    def rank(self, items: list[Item]) -> list[Item]:
-        """Return items sorted by score descending."""
-        return sorted(items, key=lambda i: self.score(i), reverse=True)
+    def rank(self, contents: list[Content]) -> list[Content]:
+        """Return contents sorted by score descending."""
+        return sorted(contents, key=lambda c: self.score(c), reverse=True)
 
     def retrieve_and_rank(
         self,
@@ -166,7 +156,7 @@ class RankingPipeline:
         source_id: str | None = None,
         limit: int = 50,
         objective: str | None = None,
-    ) -> tuple[list[Item], RankingStats]:
+    ) -> tuple[list[Content], RankingStats]:
         """Full pipeline: retrieve candidates, score, rank, return top.
 
         Args:
@@ -181,7 +171,7 @@ class RankingPipeline:
             (ranked_items, stats)
         """
         # Step 1: Retrieve candidates
-        items, retrieval_stats = self.retriever.retrieve(
+        contents, retrieval_stats = self.retriever.retrieve(
             store=store,
             seen=seen,
             hidden=hidden,
@@ -190,7 +180,7 @@ class RankingPipeline:
 
         # Step 2: Score all candidates
         t1 = time.perf_counter()
-        scored = [(item, self.score(item, objective=objective)) for item in items]
+        scored = [(content, self.score(content, objective=objective)) for content in contents]
         score_time_ms = (time.perf_counter() - t1) * 1000
 
         # Step 3: Sort by score
@@ -215,37 +205,38 @@ class RankingPipeline:
             f"score={stats.score_time_ms:.0f}ms, sort={stats.sort_time_ms:.0f}ms)"
         )
 
-        # Return top items with scores attached
-        top_items = [item for item, _ in scored[:limit]]
-        return top_items, stats
+        # Return top contents with scores attached
+        top_contents = [content for content, _ in scored[:limit]]
+        return top_contents, stats
 
     def rank_with_diversity(
         self,
-        items: list[Item],
+        contents: list[Content],
         max_per_source: int = 3,
-    ) -> list[Item]:
-        """Rank items with diversity injection.
+        store: "Store" = None,
+    ) -> list[Content]:
+        """Rank contents with diversity injection.
 
         Limits consecutive items from same source.
         """
-        scored = [(item, self.score(item)) for item in items]
+        scored = [(c, self.score(c)) for c in contents]
         scored.sort(key=lambda x: x[1], reverse=True)
 
         result = []
         source_counts: dict[str, int] = {}
-        deferred: list[tuple[Item, float]] = []
+        deferred: list[tuple[Content, float]] = []
 
-        for item, score in scored:
-            count = source_counts.get(item.source_id, 0)
+        for content, score in scored:
+            source_key = _get_source_key(content, store)
+            count = source_counts.get(source_key, 0)
             if count < max_per_source:
-                result.append(item)
-                source_counts[item.source_id] = count + 1
+                result.append(content)
+                source_counts[source_key] = count + 1
             else:
-                deferred.append((item, score))
+                deferred.append((content, score))
 
-        # Add deferred items at the end
-        for item, _ in deferred:
-            result.append(item)
+        for content, _ in deferred:
+            result.append(content)
 
         return result
 
@@ -258,4 +249,4 @@ def create_default_pipeline() -> RankingPipeline:
     registry.register(FreshnessExtractor())
     registry.register(ContentTypeExtractor())
 
-    return RankingPipeline(registry, retriever=AllRetriever())
+    return RankingPipeline(registry, retriever=ContentRetriever())

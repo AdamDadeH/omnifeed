@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from omnifeed.models import Item, ExplicitFeedback
+from omnifeed.models import Content, ExplicitFeedback
 from omnifeed.store.base import Store
 from omnifeed.ranking.model import (
     TrainingExample,
@@ -269,13 +269,9 @@ class MultiObjectiveModel:
 
         return features
 
-    def predict(self, item: Item) -> dict[str, float]:
-        """Predict reward scores for all objectives.
-
-        Returns:
-            dict mapping objective -> predicted reward (0-5)
-        """
-        if not self.is_trained or not item.embeddings:
+    def predict(self, content: Content) -> dict[str, float]:
+        """Predict reward scores for all objectives."""
+        if not self.is_trained or not content.embeddings:
             return {obj: 2.5 for obj in OBJECTIVE_TYPES}
 
         try:
@@ -283,11 +279,11 @@ class MultiObjectiveModel:
         except ImportError:
             return {obj: 2.5 for obj in OBJECTIVE_TYPES}
 
-        # Collect embeddings
+        # Collect embeddings (handle both Embedding objects and dicts)
         embeddings_by_type = {}
-        for emb_entry in item.embeddings:
-            emb_type = emb_entry.get("type")
-            emb_vector = emb_entry.get("vector")
+        for emb in content.embeddings:
+            emb_type = emb.get("type") if isinstance(emb, dict) else emb.type
+            emb_vector = emb.get("vector") if isinstance(emb, dict) else emb.vector
             if emb_type and emb_vector:
                 embeddings_by_type[emb_type] = emb_vector
 
@@ -296,13 +292,13 @@ class MultiObjectiveModel:
 
         # Build features
         ex = MultiObjectiveExample(
-            item_id=item.id,
+            item_id=content.id,
             embeddings_by_type=embeddings_by_type,
-            source_id=item.source_id,
+            source_id="",
             clicked=False,
-            content_type=item.content_type.value,
-            has_thumbnail=bool(item.metadata.get("thumbnail")),
-            title_length=len(item.title),
+            content_type=content.content_type.value,
+            has_thumbnail=bool(content.metadata.get("thumbnail")),
+            title_length=len(content.title),
         )
         features = self._build_features(ex)
         X = np.array([features])
@@ -319,9 +315,9 @@ class MultiObjectiveModel:
 
         return results
 
-    def predict_click(self, item: Item) -> float:
+    def predict_click(self, content: Content) -> float:
         """Predict click probability."""
-        if not self.is_trained or not item.embeddings or self.click_model is None:
+        if not self.is_trained or not content.embeddings or self.click_model is None:
             return 0.5
 
         try:
@@ -330,9 +326,9 @@ class MultiObjectiveModel:
             return 0.5
 
         embeddings_by_type = {}
-        for emb_entry in item.embeddings:
-            emb_type = emb_entry.get("type")
-            emb_vector = emb_entry.get("vector")
+        for emb in content.embeddings:
+            emb_type = emb.get("type") if isinstance(emb, dict) else emb.type
+            emb_vector = emb.get("vector") if isinstance(emb, dict) else emb.vector
             if emb_type and emb_vector:
                 embeddings_by_type[emb_type] = emb_vector
 
@@ -340,36 +336,27 @@ class MultiObjectiveModel:
             return 0.5
 
         ex = MultiObjectiveExample(
-            item_id=item.id,
+            item_id=content.id,
             embeddings_by_type=embeddings_by_type,
-            source_id=item.source_id,
+            source_id="",
             clicked=False,
-            content_type=item.content_type.value,
-            has_thumbnail=bool(item.metadata.get("thumbnail")),
-            title_length=len(item.title),
+            content_type=content.content_type.value,
+            has_thumbnail=bool(content.metadata.get("thumbnail")),
+            title_length=len(content.title),
         )
         features = self._build_features(ex)
         X = self.scaler.transform([features])
 
         return float(self.click_model.predict_proba(X)[0, 1])
 
-    def score(self, item: Item, objective: str | None = None) -> float:
-        """Compute ranking score for an item.
-
-        Args:
-            item: The item to score
-            objective: Which objective to optimize for. If None, uses average.
-
-        Returns:
-            Ranking score (higher = better)
-        """
-        click_prob = self.predict_click(item)
-        rewards = self.predict(item)
+    def score(self, content: Content, objective: str | None = None) -> float:
+        """Compute ranking score for content."""
+        click_prob = self.predict_click(content)
+        rewards = self.predict(content)
 
         if objective and objective in rewards:
             expected_reward = rewards[objective]
         else:
-            # Average across all objectives
             expected_reward = sum(rewards.values()) / len(rewards)
 
         if self.click_model is not None:

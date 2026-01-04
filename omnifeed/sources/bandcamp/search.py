@@ -30,12 +30,15 @@ class BandcampSearchProvider(SearchProvider):
             html = response.text
             suggestions = []
 
+            # Updated pattern for current Bandcamp HTML structure
+            # Matches: <li class="searchresult data-search" ...>...</li>
             result_pattern = re.compile(
-                r'<li class="searchresult band".*?'
+                r'<li class="searchresult[^"]*"[^>]*>.*?'
                 r'<img[^>]+src="([^"]*)".*?'
-                r'<div class="heading">\s*<a href="([^"]+)"[^>]*>([^<]+)</a>.*?'
-                r'(?:<div class="subhead">\s*([^<]*)</div>)?.*?'
-                r'(?:<div class="genre">\s*([^<]*)</div>)?',
+                r'<div class="heading">\s*<a href="([^"]+)"[^>]*>\s*([^<]+?)\s*</a>.*?'
+                r'(?:<div class="subhead">\s*([^<]*?)\s*</div>)?.*?'
+                r'(?:<div class="genre">\s*([^<]*?)\s*</div>)?.*?'
+                r'</li>',
                 re.DOTALL
             )
 
@@ -49,6 +52,9 @@ class BandcampSearchProvider(SearchProvider):
                 subhead = match.group(4).strip() if match.group(4) else ""
                 genre = match.group(5).strip() if match.group(5) else ""
 
+                # Clean URL by removing tracking params
+                clean_url = artist_url.split("?")[0]
+
                 desc_parts = []
                 if genre:
                     desc_parts.append(genre)
@@ -56,11 +62,11 @@ class BandcampSearchProvider(SearchProvider):
                     desc_parts.append(subhead)
                 description = " · ".join(desc_parts)
 
-                slug_match = re.match(r"https?://([^.]+)\.bandcamp\.com", artist_url)
+                slug_match = re.match(r"https?://([^.]+)\.bandcamp\.com", clean_url)
                 slug = slug_match.group(1) if slug_match else None
 
                 suggestions.append(SourceSuggestion(
-                    url=artist_url,
+                    url=clean_url,
                     name=name,
                     source_type="bandcamp",
                     description=description,

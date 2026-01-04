@@ -10,10 +10,10 @@ from rich.console import Console
 from rich.table import Table
 
 from omnifeed.config import Config
-from omnifeed.models import Item, ContentType, ConsumptionType
+from omnifeed.models import Content, ContentType, ConsumptionType
 from omnifeed.store import Store
 from omnifeed.adapters import create_default_registry
-from omnifeed.ranking.pipeline import create_default_pipeline
+from omnifeed.ranking.pipeline import create_default_pipeline, ContentRetriever
 
 
 console = Console()
@@ -255,33 +255,33 @@ def sources_disable(source_id: str) -> None:
 @main.command("feed")
 @click.option("--all", "show_all", is_flag=True, help="Include seen items")
 @click.option("--limit", default=20, help="Number of items to show")
-@click.option("--source", "source_id", help="Filter by source ID")
-def feed(show_all: bool, limit: int, source_id: str | None) -> None:
+@click.option("--source", "source_type", help="Filter by source type (e.g., youtube, rss)")
+def feed(show_all: bool, limit: int, source_type: str | None) -> None:
     """Show the feed."""
     pipeline = create_default_pipeline()
+    retriever = ContentRetriever()
 
     with get_store() as store:
-        # Get items
         seen_filter = None if show_all else False
-        items = store.get_items(
+        contents, _ = retriever.retrieve(
+            store=store,
             seen=seen_filter,
             hidden=False,
-            source_id=source_id,
-            limit=limit * 2,  # Get more than needed for ranking
+            source_type=source_type,
+            limit=limit * 2,
         )
 
-        if not items:
+        if not contents:
             if show_all:
-                console.print("[dim]No items in feed. Add sources and poll them.[/dim]")
+                console.print("[dim]No content in feed. Add sources and poll them.[/dim]")
             else:
-                console.print("[dim]No unread items. Use --all to see all items.[/dim]")
+                console.print("[dim]No unread content. Use --all to see all content.[/dim]")
             return
 
-        # Rank items
-        ranked = pipeline.rank(items)[:limit]
-
-        # Get sources for display names
-        sources_map = {s.id: s for s in store.list_sources()}
+        # Score and sort
+        scored = [(c, pipeline.score(c)) for c in contents]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        ranked = [c for c, _ in scored[:limit]]
 
         # Display
         table = Table(show_header=True, show_lines=False)
@@ -290,158 +290,159 @@ def feed(show_all: bool, limit: int, source_id: str | None) -> None:
         table.add_column("Source", width=20, no_wrap=True)
         table.add_column("Title")
 
-        for i, item in enumerate(ranked, 1):
-            source = sources_map.get(item.source_id)
-            source_name = source.display_name if source else "Unknown"
+        for i, content in enumerate(ranked, 1):
+            primary = store.get_primary_encoding(content.id)
+            source_display = primary.source_type if primary else "unknown"
 
-            # Truncate title if needed
-            title = item.title
+            title = content.title
             if len(title) > 60:
                 title = title[:57] + "..."
 
-            # Dim seen items
-            style = "dim" if item.seen else ""
+            style = "dim" if content.seen else ""
 
             table.add_row(
                 str(i),
-                format_age(item.published_at),
-                source_name[:20],
+                format_age(content.published_at),
+                source_display[:20],
                 title,
                 style=style,
             )
 
         console.print(table)
         console.print()
-        console.print("[dim]Commands: open <#>, seen <#>, hide <#>[/dim]")
+        console.print("[dim]Commands: open <#>, seen <#>, show <#>[/dim]")
 
-        # Store the ranked items for quick access
         _store_feed_cache(ranked)
 
 
 # Simple cache for last displayed feed
-_last_feed: list[Item] = []
+_last_feed: list[Content] = []
 
 
-def _store_feed_cache(items: list[Item]) -> None:
+def _store_feed_cache(contents: list[Content]) -> None:
     global _last_feed
-    _last_feed = items
+    _last_feed = contents
 
 
-def _get_cached_item(index: int) -> Item | None:
+def _get_cached_content(index: int) -> Content | None:
     if 0 < index <= len(_last_feed):
         return _last_feed[index - 1]
     return None
 
 
+def _resolve_content(store: Store, ref: str) -> Content | None:
+    """Resolve a content reference (# from feed or ID)."""
+    if ref.isdigit():
+        index = int(ref)
+        cached = _get_cached_content(index)
+        if cached:
+            return store.get_content(cached.id)
+    return store.get_content(ref)
+
+
 # =============================================================================
-# Item commands
+# Content commands
 # =============================================================================
 
 
 @main.command("open")
-@click.argument("item_ref")
-def open_item(item_ref: str) -> None:
-    """Open an item in browser and mark as seen."""
+@click.argument("ref")
+def open_content(ref: str) -> None:
+    """Open content in browser and mark as seen."""
     with get_store() as store:
-        item = _resolve_item(store, item_ref)
-        if not item:
-            console.print(f"[red]Item not found: {item_ref}[/red]")
+        content = _resolve_content(store, ref)
+        if not content:
+            console.print(f"[red]Content not found: {ref}[/red]")
             sys.exit(1)
 
-        # Open in browser
-        webbrowser.open(item.url)
-        console.print(f"[dim]Opening: {item.title}[/dim]")
+        primary = store.get_primary_encoding(content.id)
+        if not primary:
+            console.print(f"[red]No URL found for content[/red]")
+            sys.exit(1)
 
-        # Mark as seen
-        store.mark_seen(item.id)
+        webbrowser.open(primary.uri)
+        console.print(f"[dim]Opening: {content.title}[/dim]")
+
+        store.mark_content_seen(content.id)
 
 
 @main.command("seen")
-@click.argument("item_ref")
-def mark_seen(item_ref: str) -> None:
-    """Mark an item as seen without opening."""
+@click.argument("ref")
+def mark_seen(ref: str) -> None:
+    """Mark content as seen without opening."""
     with get_store() as store:
-        item = _resolve_item(store, item_ref)
-        if not item:
-            console.print(f"[red]Item not found: {item_ref}[/red]")
+        content = _resolve_content(store, ref)
+        if not content:
+            console.print(f"[red]Content not found: {ref}[/red]")
             sys.exit(1)
 
-        store.mark_seen(item.id)
-        console.print(f"[green]Marked as seen: {item.title}[/green]")
+        store.mark_content_seen(content.id)
+        console.print(f"[green]Marked as seen: {content.title}[/green]")
 
 
 @main.command("unseen")
-@click.argument("item_ref")
-def mark_unseen(item_ref: str) -> None:
-    """Mark an item as unseen."""
+@click.argument("ref")
+def mark_unseen(ref: str) -> None:
+    """Mark content as unseen."""
     with get_store() as store:
-        item = _resolve_item(store, item_ref)
-        if not item:
-            console.print(f"[red]Item not found: {item_ref}[/red]")
+        content = _resolve_content(store, ref)
+        if not content:
+            console.print(f"[red]Content not found: {ref}[/red]")
             sys.exit(1)
 
-        store.mark_seen(item.id, seen=False)
-        console.print(f"[green]Marked as unseen: {item.title}[/green]")
+        store.mark_content_seen(content.id, seen=False)
+        console.print(f"[green]Marked as unseen: {content.title}[/green]")
 
 
 @main.command("hide")
-@click.argument("item_ref")
-def hide_item(item_ref: str) -> None:
-    """Hide an item permanently."""
+@click.argument("ref")
+def hide_content(ref: str) -> None:
+    """Hide content permanently."""
     with get_store() as store:
-        item = _resolve_item(store, item_ref)
-        if not item:
-            console.print(f"[red]Item not found: {item_ref}[/red]")
+        content = _resolve_content(store, ref)
+        if not content:
+            console.print(f"[red]Content not found: {ref}[/red]")
             sys.exit(1)
 
-        store.mark_hidden(item.id)
-        console.print(f"[yellow]Hidden: {item.title}[/yellow]")
+        store.mark_content_hidden(content.id)
+        console.print(f"[yellow]Hidden: {content.title}[/yellow]")
 
 
 @main.command("show")
-@click.argument("item_ref")
-def show_item_detail(item_ref: str) -> None:
-    """Show details for an item."""
+@click.argument("ref")
+def show_detail(ref: str) -> None:
+    """Show details for content."""
     with get_store() as store:
-        item = _resolve_item(store, item_ref)
-        if not item:
-            console.print(f"[red]Item not found: {item_ref}[/red]")
+        content = _resolve_content(store, ref)
+        if not content:
+            console.print(f"[red]Content not found: {ref}[/red]")
             sys.exit(1)
 
-        sources_map = {s.id: s for s in store.list_sources()}
-        source = sources_map.get(item.source_id)
+        encodings = store.get_encodings_for_content(content.id)
+        primary = next((e for e in encodings if e.is_primary), encodings[0] if encodings else None)
 
         console.print()
-        console.print(f"[bold]{item.title}[/bold]")
+        console.print(f"[bold]{content.title}[/bold]")
         console.print()
-        console.print(f"[dim]ID:[/dim] {item.id}")
-        console.print(f"[dim]Source:[/dim] {source.display_name if source else 'Unknown'}")
-        console.print(f"[dim]Author:[/dim] {item.creator_name}")
-        console.print(f"[dim]Published:[/dim] {item.published_at.strftime('%Y-%m-%d %H:%M')}")
-        console.print(f"[dim]Type:[/dim] {item.content_type.value}")
-        console.print(f"[dim]URL:[/dim] {item.url}")
-        console.print()
+        console.print(f"[dim]ID:[/dim] {content.id}")
+        console.print(f"[dim]Type:[/dim] {content.content_type.value}")
+        console.print(f"[dim]Published:[/dim] {content.published_at.strftime('%Y-%m-%d %H:%M')}")
+        console.print(f"[dim]Seen:[/dim] {content.seen}")
 
-        # Show description if available
-        if item.metadata.get("content_text"):
-            desc = item.metadata["content_text"][:500]
-            console.print(f"[dim]Preview:[/dim]")
+        if encodings:
+            console.print()
+            console.print("[bold]Available from:[/bold]")
+            for enc in encodings:
+                tag = " (primary)" if enc.is_primary else ""
+                console.print(f"  - {enc.source_type}: {enc.uri}{tag}")
+
+        if content.metadata.get("content_text"):
+            desc = content.metadata["content_text"][:500]
+            console.print()
+            console.print("[dim]Preview:[/dim]")
             console.print(desc)
-            if len(item.metadata["content_text"]) > 500:
+            if len(content.metadata["content_text"]) > 500:
                 console.print("[dim]...[/dim]")
-
-
-def _resolve_item(store: Store, item_ref: str) -> Item | None:
-    """Resolve an item reference (# from feed or ID)."""
-    # Try as feed index first
-    if item_ref.isdigit():
-        index = int(item_ref)
-        cached = _get_cached_item(index)
-        if cached:
-            return store.get_item(cached.id)
-
-    # Try as item ID
-    return store.get_item(item_ref)
 
 
 # =============================================================================
@@ -454,15 +455,15 @@ def show_stats() -> None:
     """Show feed statistics."""
     with get_store() as store:
         sources_list = store.list_sources()
-        total_items = store.count_items(hidden=False)
-        unseen_items = store.count_items(seen=False, hidden=False)
-        hidden_items = store.count_items(hidden=True)
+        total_content = store.count_content(hidden=False)
+        unseen_content = store.count_content(seen=False, hidden=False)
+        hidden_content = store.count_content(hidden=True)
 
         console.print()
         console.print(f"[bold]Sources:[/bold] {len(sources_list)}")
-        console.print(f"[bold]Total items:[/bold] {total_items}")
-        console.print(f"[bold]Unread:[/bold] {unseen_items}")
-        console.print(f"[bold]Hidden:[/bold] {hidden_items}")
+        console.print(f"[bold]Total content:[/bold] {total_content}")
+        console.print(f"[bold]Unread:[/bold] {unseen_content}")
+        console.print(f"[bold]Hidden:[/bold] {hidden_content}")
         console.print()
 
 

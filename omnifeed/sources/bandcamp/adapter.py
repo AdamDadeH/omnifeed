@@ -89,7 +89,16 @@ class BandcampAdapter(SourceAdapter):
         )
 
     def poll(self, source: SourceInfo, since: datetime | None = None) -> list[RawItem]:
-        slug = source.metadata.get("slug", source.uri.replace("bandcamp:", ""))
+        slug = source.metadata.get("slug")
+        if not slug:
+            # Handle both URI formats: "bandcamp:slug" or full URL
+            uri = source.uri
+            if uri.startswith("bandcamp:"):
+                slug = uri.replace("bandcamp:", "")
+            elif ".bandcamp.com" in uri:
+                slug = self._get_artist_slug(uri)
+            else:
+                slug = uri
         base_url = f"https://{slug}.bandcamp.com"
         music_url = f"{base_url}/music"
 
@@ -199,11 +208,17 @@ class BandcampAdapter(SourceAdapter):
             credits = re.sub(r'<[^>]+>', ' ', credits_match.group(1)).strip()
             credits = re.sub(r'\s+', ' ', credits)
 
-        # Extract audio preview
+        # Extract audio preview (handle both literal quotes and HTML entities)
         audio_url = None
+        # Try literal quotes first
         audio_match = re.search(r'"mp3-128"\s*:\s*"([^"]+)"', html)
+        if not audio_match:
+            # Try HTML entity encoded quotes (&quot;)
+            audio_match = re.search(r'&quot;mp3-128&quot;\s*:\s*&quot;([^&]+(?:&amp;[^&]+)*)', html)
         if audio_match:
             audio_url = audio_match.group(1)
+            # Decode HTML entities in URL
+            audio_url = audio_url.replace("&amp;", "&").replace("&quot;", "")
 
         # Build content text for embeddings
         content_parts = [title, f"by {artist}"]

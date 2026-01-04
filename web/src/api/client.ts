@@ -324,3 +324,122 @@ export interface ProxiedContent {
 export async function fetchProxiedContent(url: string): Promise<ProxiedContent> {
   return fetchJson(`${API_BASE}/proxy/content?url=${encodeURIComponent(url)}`);
 }
+
+// Explore / Retrievers
+
+export interface Retriever {
+  id: string;
+  display_name: string;
+  kind: string;
+  handler_type: string;
+  uri: string;
+  score: number | null;
+  confidence: number | null;
+  is_enabled: boolean;
+}
+
+export interface ExploreResult {
+  retrievers: Retriever[];
+  items: FeedItem[];
+  topic: string | null;
+}
+
+export async function explore(topic?: string, limit = 9): Promise<ExploreResult> {
+  const params = new URLSearchParams();
+  if (topic) params.set('topic', topic);
+  params.set('limit', limit.toString());
+  return fetchJson(`${API_BASE}/explore?${params.toString()}`, { method: 'POST' });
+}
+
+export async function getRetrievers(kind?: string, limit = 50): Promise<Retriever[]> {
+  const params = new URLSearchParams();
+  if (kind) params.set('kind', kind);
+  params.set('limit', limit.toString());
+  return fetchJson(`${API_BASE}/retrievers?${params.toString()}`);
+}
+
+export async function getTopRetrievers(limit = 10): Promise<Retriever[]> {
+  return fetchJson(`${API_BASE}/retrievers/top?limit=${limit}`);
+}
+
+export async function addRetriever(uri: string, displayName?: string): Promise<Retriever> {
+  return fetchJson(`${API_BASE}/retrievers`, {
+    method: 'POST',
+    body: JSON.stringify({ uri, display_name: displayName }),
+  });
+}
+
+export async function deleteRetriever(retrieverId: string): Promise<void> {
+  await fetchJson(`${API_BASE}/retrievers/${retrieverId}`, { method: 'DELETE' });
+}
+
+// Control Plane / Strategies
+
+export async function getRetrieverDetail(
+  retrieverId: string
+): Promise<import('./types').RetrieverDetail> {
+  return fetchJson(`${API_BASE}/retrievers/${retrieverId}`);
+}
+
+export async function getRetrieverChildren(
+  retrieverId: string
+): Promise<import('./types').RetrieverDetail[]> {
+  return fetchJson(`${API_BASE}/retrievers/${retrieverId}/children`);
+}
+
+export async function getRetrieverHierarchy(): Promise<
+  import('./types').RetrieverHierarchyNode[]
+> {
+  return fetchJson(`${API_BASE}/retrievers/hierarchy`);
+}
+
+export interface UpdateRetrieverPayload {
+  is_enabled?: boolean;
+  display_name?: string;
+  config?: Record<string, unknown>;
+}
+
+export async function updateRetriever(
+  retrieverId: string,
+  payload: UpdateRetrieverPayload
+): Promise<import('./types').RetrieverDetail> {
+  return fetchJson(`${API_BASE}/retrievers/${retrieverId}`, {
+    method: 'PATCH',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getExplorationConfig(): Promise<
+  import('./types').ExplorationConfig
+> {
+  return fetchJson(`${API_BASE}/exploration/config`);
+}
+
+export async function updateExplorationConfig(
+  config: import('./types').ExplorationConfig
+): Promise<import('./types').ExplorationConfig> {
+  return fetchJson(`${API_BASE}/exploration/config`, {
+    method: 'PUT',
+    body: JSON.stringify(config),
+  });
+}
+
+export async function getExplorationStats(): Promise<
+  import('./types').ExplorationStats
+> {
+  return fetchJson(`${API_BASE}/exploration/stats`);
+}
+
+// Strategies
+
+export async function getStrategies(): Promise<import('./types').Strategy[]> {
+  return fetchJson(`${API_BASE}/strategies`);
+}
+
+export async function enableStrategy(strategyId: string): Promise<{ status: string; retriever_id: string | null }> {
+  return fetchJson(`${API_BASE}/strategies/${strategyId}/enable`, { method: 'POST' });
+}
+
+export async function disableStrategy(strategyId: string): Promise<{ status: string; retriever_id?: string }> {
+  return fetchJson(`${API_BASE}/strategies/${strategyId}/disable`, { method: 'POST' });
+}

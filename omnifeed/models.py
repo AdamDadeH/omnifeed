@@ -40,27 +40,6 @@ class ConsumptionType(Enum):
     SERIALIZED = "serialized"  # Part of a series (episode, chapter)
 
 
-class PlatformCapability(Enum):
-    """Capabilities a platform can provide for content delivery."""
-    STREAM = "stream"           # Can play in-app (YouTube, Spotify)
-    DOWNLOAD = "download"       # Can download for offline
-    PURCHASE = "purchase"       # Can buy permanently (Bandcamp, Qobuz)
-    EMBED = "embed"            # Can embed in other pages (YouTube, Spotify)
-    RENDER = "render"          # Can render content (articles, HTML)
-
-
-class SignalType(Enum):
-    """Type of discovery signal indicating why content is recommended."""
-    CHART_POSITION = "chart_position"   # Ranked on a chart (RYM top albums)
-    USER_RATING = "user_rating"         # User rating (4.5 stars on Letterboxd)
-    RECOMMENDATION = "recommendation"   # Personal recommendation
-    MENTION = "mention"                 # Mentioned in content (podcast discussed)
-    AWARD = "award"                     # Won or nominated for award
-    TRENDING = "trending"               # Viral or trending
-    ALGORITHMIC = "algorithmic"         # Algorithm thinks you'll like it
-    CURATED = "curated"                 # Expert/editorial curation
-
-
 class CreatorType(Enum):
     """Type of content creator."""
     INDIVIDUAL = "individual"  # Single person
@@ -286,69 +265,12 @@ class SourceStats:
 
 
 # =============================================================================
-# Platform vs Discovery Source Architecture
+# Discovery Signals
 #
-# Platform: Delivers consumable media bytes or renderable content.
-#   Examples: YouTube, Qobuz, Spotify, Netflix, Bandcamp
-#
-# DiscoverySource: Provides signals about what content exists and why you
-#   should engage with it. Points TO content, doesn't host it.
-#   Examples: RateYourMusic charts, Letterboxd lists, award lists, newsletters
+# Some sources (e.g., RYM charts, Letterboxd lists) provide signals about
+# content worth consuming rather than the content itself. These signals
+# point TO content and explain why you should engage with it.
 # =============================================================================
-
-
-@dataclass
-class Platform:
-    """A service that delivers consumable media (video, audio, articles).
-
-    Platforms can stream, download, or render actual content. They may also
-    have discovery features (recommendations, trending), but their primary
-    function is content delivery.
-
-    Examples: YouTube, Qobuz, Spotify, Bandcamp, Netflix
-    """
-    id: str
-    name: str                                    # "Qobuz", "YouTube"
-    platform_type: str                           # "music_streaming", "video_streaming"
-    content_types: list[ContentType]             # [AUDIO], [VIDEO], etc.
-    capabilities: list[PlatformCapability]       # [STREAM, DOWNLOAD, PURCHASE]
-
-    # Configuration
-    auth_required: bool = False
-    api_available: bool = False
-    base_url: str | None = None                  # "https://www.qobuz.com"
-
-    # Matching configuration
-    url_patterns: list[str] = field(default_factory=list)  # ["qobuz.com/album/"]
-
-    metadata: dict[str, Any] = field(default_factory=dict)
-    created_at: datetime = field(default_factory=datetime.utcnow)
-
-
-@dataclass
-class DiscoverySource:
-    """A source that provides signals about content worth consuming.
-
-    Discovery sources point TO content but don't host it. They provide context
-    about why you should engage (rankings, ratings, recommendations, awards).
-
-    Examples: RateYourMusic charts, Letterboxd lists, Hugo Awards, newsletters
-    """
-    id: str
-    name: str                                    # "RateYourMusic Charts"
-    source_type: str                             # "chart", "list", "awards", "newsletter"
-    content_types: list[ContentType]             # [AUDIO] for RYM, [FILM] for Letterboxd
-
-    # Which platforms typically have this content
-    typical_platforms: list[str] = field(default_factory=list)  # ["qobuz", "spotify"]
-
-    # Polling configuration for scraping
-    poll_url: str | None = None
-    poll_interval_seconds: int = 86400           # Daily by default
-
-    metadata: dict[str, Any] = field(default_factory=dict)
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    last_polled_at: datetime | None = None
 
 
 @dataclass
@@ -369,55 +291,134 @@ class ContentInfo:
 
 @dataclass
 class DiscoverySignal:
-    """A signal from a discovery source about content worth consuming.
+    """A signal from a source about content worth consuming.
 
-    Links discovery sources to content with context about why it's recommended.
+    Links sources to content with context about why it's recommended.
     One piece of content can have multiple signals from different sources.
     """
     id: str
-    source_id: str                               # FK to DiscoverySource
+    source_id: str                               # FK to Source
     item_id: str | None = None                   # FK to Item (resolved content)
 
     # Content identification (before resolution)
     content_info: ContentInfo | None = None
 
     # Signal metadata
-    signal_type: SignalType = SignalType.CURATED
     rank: int | None = None                      # Position in list (1 = top)
     rating: float | None = None                  # Source rating (e.g., RYM 3.92)
     context: str | None = None                   # "#3 on RYM Top Albums 2025"
-    recommender: str | None = None               # Who recommended (for social)
     url: str | None = None                       # Link to discovery page
 
     discovered_at: datetime = field(default_factory=datetime.utcnow)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass
-class PlatformInstance:
-    """Where a piece of content can be consumed on a platform.
+# =============================================================================
+# Content + Encoding Model
+#
+# Content represents WHAT something is (a song, video, article).
+# Encoding represents WHERE/HOW to access it (YouTube URL, Qobuz deep link).
+# One Content can have multiple Encodings (same song on Spotify and Bandcamp).
+# =============================================================================
 
-    Links content (Item) to platforms where it's available. One piece of
-    content may be available on multiple platforms with different quality
-    tiers, prices, and availability.
+
+@dataclass
+class Embedding:
+    """A featurized representation of content."""
+    name: str          # "transcript", "description", "audio_sample"
+    type: str          # "text", "audio", "image"
+    vector: list[float]
+    model: str = ""    # "all-MiniLM-L6-v2", "laion/clap"
+
+
+@dataclass
+class Content:
+    """Abstract content - what it IS, not where it lives.
+
+    Content represents a piece of content independent of how it's accessed.
+    The same song can have multiple Encodings (Qobuz, Bandcamp, YouTube).
+    Content can exist without any Encodings (references to books we know about).
     """
     id: str
-    item_id: str                                 # FK to Item (content)
-    platform_id: str                             # FK to Platform
-    platform_item_id: str                        # ID within the platform
-    url: str                                     # Direct URL to consume
+    title: str
+    content_type: ContentType
+    published_at: datetime
+    ingested_at: datetime  # First time we learned about it
 
-    # Availability info
-    availability: str = "available"              # "available", "region_locked", "unavailable"
-    quality_tiers: list[str] = field(default_factory=list)  # ["FLAC", "Hi-Res 24-bit"]
-    price: float | None = None                   # For purchase platforms
-    currency: str | None = None
+    # Creators (usually multiple - songs have artists, papers have authors)
+    creator_ids: list[str] = field(default_factory=list)
 
-    # Region restrictions
-    region_locks: list[str] = field(default_factory=list)  # ["US", "EU"]
+    consumption_type: ConsumptionType = ConsumptionType.ONE_SHOT
 
-    # Match confidence (0.0-1.0) when auto-matched
-    match_confidence: float = 1.0
+    # Cross-platform identity (ISBN, IMDB, etc.)
+    canonical_ids: dict[str, str] = field(default_factory=dict)
+
+    # User state
+    seen: bool = False
+    hidden: bool = False
+
+    # Series tracking
+    series_id: str | None = None
+    series_position: int | None = None
+
+    # Content-level metadata (content_text, description)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    # Featurized representations
+    embeddings: list[Embedding] = field(default_factory=list)
+
+
+@dataclass
+class Encoding:
+    """A specific way to access content on a platform.
+
+    Encodings link Content to platform-specific access methods.
+    Examples:
+    - YouTube video URL
+    - Qobuz deep link (qobuz://track/12345)
+    - Bandcamp album page
+    - Local file path
+    """
+    id: str
+    content_id: str              # FK to Content
+
+    source_type: str             # "youtube", "qobuz", "bandcamp", "web"
+    external_id: str             # Platform-specific ID
+    uri: str                     # URL or deep link
+
+    media_type: str | None = None    # "video/youtube", "audio/flac"
+
+    # Encoding-specific metadata (view_count, duration, bitrate)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     discovered_at: datetime = field(default_factory=datetime.utcnow)
-    metadata: dict[str, Any] = field(default_factory=dict)
+    is_primary: bool = False     # First encoding we found
+
+
+@dataclass
+class ContentWithEncoding:
+    """Convenience wrapper for the common 1:1 case.
+
+    Most content is discovered from a single source, so this wrapper
+    simplifies handling when you have exactly one encoding.
+    """
+    content: Content
+    encoding: Encoding
+
+    @property
+    def id(self) -> str:
+        """Content ID for backwards compatibility."""
+        return self.content.id
+
+    @property
+    def url(self) -> str:
+        """Primary URL for backwards compatibility."""
+        return self.encoding.uri
+
+    @property
+    def title(self) -> str:
+        return self.content.title
+
+    @property
+    def content_type(self) -> ContentType:
+        return self.content.content_type

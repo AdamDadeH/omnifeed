@@ -7,4 +7,7 @@ export { StatsView } from './StatsView';
 export { SourcesView } from './SourcesView';
 export { CreatorsView } from './CreatorsView';
 export { RatedView } from './RatedView';
+export { ExploreView } from './ExploreView';
+export { QueueView } from './QueueView';
+export { StrategiesView } from './StrategiesView';
 export type { ReadingFeedback } from './ReaderPane';

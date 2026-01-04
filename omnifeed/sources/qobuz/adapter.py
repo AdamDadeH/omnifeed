@@ -1,6 +1,5 @@
 """Qobuz adapter for artist catalogs and new releases."""
 
-import os
 import re
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs
@@ -15,18 +14,21 @@ QOBUZ_APP_ID = "950096963"  # Default from web player
 
 
 def get_qobuz_credentials() -> dict:
-    """Get Qobuz credentials from environment or config."""
-    app_id = os.environ.get("QOBUZ_APP_ID", QOBUZ_APP_ID)
-    user_token = os.environ.get("QOBUZ_USER_TOKEN")
+    """Get Qobuz credentials from config file.
 
-    if not user_token:
-        try:
-            from omnifeed.config import Config
-            config = Config.load()
-            user_token = config.extra.get("qobuz_user_token")
-            app_id = config.extra.get("qobuz_app_id", app_id)
-        except Exception:
-            pass
+    Set in ~/.omnifeed/config.json:
+        {"extra": {"qobuz_user_token": "your_token", "qobuz_app_id": "optional_app_id"}}
+    """
+    app_id = QOBUZ_APP_ID
+    user_token = None
+
+    try:
+        from omnifeed.config import Config
+        config = Config.load()
+        user_token = config.extra.get("qobuz_user_token")
+        app_id = config.extra.get("qobuz_app_id", app_id)
+    except Exception:
+        pass
 
     return {"app_id": app_id, "user_token": user_token}
 
@@ -125,7 +127,15 @@ class QobuzAdapter(SourceAdapter):
     def poll(self, source: SourceInfo, since: datetime | None = None) -> list[RawItem]:
         artist_id = source.metadata.get("artist_id")
         if not artist_id:
-            artist_id = source.uri.replace("qobuz:artist:", "")
+            # Handle both URI formats: "qobuz:artist:12345" or full URL
+            uri = source.uri
+            if uri.startswith("qobuz:artist:"):
+                artist_id = uri.replace("qobuz:artist:", "")
+            elif "qobuz.com" in uri:
+                # Extract from URL
+                artist_id = self._extract_artist_id(uri)
+            else:
+                artist_id = uri
 
         data = self._api_request("artist/get", {"artist_id": artist_id, "extra": "albums", "limit": 100, "offset": 0})
         albums = data.get("albums", {}).get("items", [])
@@ -255,7 +265,14 @@ class QobuzLabelAdapter(SourceAdapter):
     def poll(self, source: SourceInfo, since: datetime | None = None) -> list[RawItem]:
         label_id = source.metadata.get("label_id")
         if not label_id:
-            label_id = source.uri.replace("qobuz:label:", "")
+            # Handle both URI formats: "qobuz:label:12345" or full URL
+            uri = source.uri
+            if uri.startswith("qobuz:label:"):
+                label_id = uri.replace("qobuz:label:", "")
+            elif "qobuz.com" in uri:
+                label_id = self._extract_label_id(uri)
+            else:
+                label_id = uri
 
         data = self._api_request("label/get", {"label_id": label_id, "extra": "albums", "limit": 100})
         albums = data.get("albums", {}).get("items", [])

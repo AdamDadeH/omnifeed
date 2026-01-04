@@ -3,6 +3,9 @@
 Supports:
 - Channels: youtube.com/@handle, youtube.com/channel/UC...
 - Playlists: youtube.com/playlist?list=PL...
+
+Content enrichment:
+- Transcripts can be fetched using fetch_transcript() to enrich content_text
 """
 
 import logging
@@ -16,6 +19,73 @@ import httpx
 from omnifeed.sources.base import SourceAdapter, SourceInfo, RawItem
 
 logger = logging.getLogger(__name__)
+
+
+def fetch_transcript(video_id: str) -> str | None:
+    """Fetch transcript for a YouTube video.
+
+    Returns the full transcript text or None if unavailable.
+    This is a standalone function that can be called to enrich content_text.
+    """
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+    except ImportError:
+        logger.debug("youtube-transcript-api not installed, skipping transcript")
+        return None
+
+    try:
+        api = YouTubeTranscriptApi()
+        # Fetch transcript, preferring English
+        transcript = api.fetch(video_id, languages=('en', 'en-US', 'en-GB'))
+
+        # Combine all text segments
+        text_parts = [entry.text for entry in transcript]
+        full_text = ' '.join(text_parts)
+
+        # Clean up common artifacts
+        full_text = full_text.replace('\n', ' ')
+        full_text = ' '.join(full_text.split())  # Normalize whitespace
+
+        return full_text
+
+    except Exception as e:
+        # Could be TranscriptsDisabled, NoTranscriptFound, etc.
+        logger.debug(f"No transcript for {video_id}: {e}")
+        return None
+
+
+def enrich_with_transcript(items: list, max_chars: int = 5000) -> int:
+    """Enrich YouTube items with transcript text in content_text.
+
+    Args:
+        items: List of Item objects with metadata containing video_id
+        max_chars: Maximum transcript length to include
+
+    Returns:
+        Number of items enriched with transcripts
+    """
+    enriched = 0
+    for item in items:
+        video_id = item.metadata.get("video_id")
+        if not video_id:
+            continue
+
+        # Skip if already has substantial content_text
+        existing = item.metadata.get("content_text", "")
+        if len(existing) > 500:  # Already has good content
+            continue
+
+        transcript = fetch_transcript(video_id)
+        if transcript:
+            # Combine existing description with transcript
+            if existing:
+                item.metadata["content_text"] = f"{existing}\n\n{transcript[:max_chars]}"
+            else:
+                item.metadata["content_text"] = transcript[:max_chars]
+            enriched += 1
+            logger.debug(f"Enriched {item.title[:50]} with transcript")
+
+    return enriched
 
 # Default max videos to fetch on initial sync (when since is None)
 # This prevents stalling on large channels
@@ -222,7 +292,28 @@ class YouTubeAdapter(SourceAdapter):
 
         playlist_id = source.metadata.get("uploads_playlist_id")
         if not playlist_id:
-            raise ValueError("Missing uploads_playlist_id in source metadata")
+            # Try to fetch channel info to get the playlist ID
+            channel_id = source.metadata.get("channel_id")
+            if not channel_id:
+                # Try to extract from URI
+                if "channel/" in source.uri:
+                    channel_id = source.uri.split("channel/")[-1].split("/")[0].split("?")[0]
+                elif source.uri.startswith("youtube:channel:"):
+                    channel_id = source.uri.split(":")[-1]
+
+            if channel_id:
+                logger.info(f"Fetching channel info for {channel_id} to get uploads playlist")
+                try:
+                    channel_info = self._get_channel_info(channel_id)
+                    playlist_id = channel_info["contentDetails"]["relatedPlaylists"]["uploads"]
+                    # Update metadata for future calls
+                    source.metadata["uploads_playlist_id"] = playlist_id
+                    source.metadata["channel_id"] = channel_id
+                except Exception as e:
+                    logger.error(f"Failed to fetch channel info: {e}")
+                    raise ValueError(f"Could not get uploads_playlist_id for channel: {e}")
+            else:
+                raise ValueError("Missing uploads_playlist_id and cannot determine channel_id")
 
         # Determine effective max_results
         # If no since date (initial sync), cap at DEFAULT_INITIAL_SYNC_MAX to prevent stalls

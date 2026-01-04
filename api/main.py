@@ -5,8 +5,11 @@ from datetime import datetime
 from contextlib import asynccontextmanager
 from typing import Any
 
+import asyncio
+import json
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from omnifeed.config import Config
@@ -16,6 +19,11 @@ from omnifeed.adapters import create_default_registry
 from omnifeed.ranking.pipeline import create_default_pipeline
 from omnifeed.creators import extract_from_item
 import logging
+
+# Configure logging to show INFO level for our modules
+logging.basicConfig(level=logging.INFO)
+logging.getLogger("omnifeed").setLevel(logging.INFO)
+logging.getLogger("api").setLevel(logging.INFO)
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +81,43 @@ class ItemResponse(BaseModel):
     canonical_ids: dict[str, str] = {}
     attributions: list[AttributionResponse] = []
     score: float | None = None  # ML ranking score (click_prob * expected_reward)
+
+
+class EncodingResponse(BaseModel):
+    """Represents a way to access content (URL, deep link, etc.)."""
+    id: str
+    source_type: str  # "youtube", "rss", "bandcamp", etc.
+    external_id: str
+    uri: str
+    media_type: str | None = None
+    metadata: dict[str, Any] = {}
+    is_primary: bool = False
+
+
+class ContentResponse(BaseModel):
+    """Content-centric response (new model, replaces ItemResponse)."""
+    id: str
+    title: str
+    content_type: str
+    published_at: datetime
+    seen: bool
+    hidden: bool
+    metadata: dict[str, Any] = {}
+    canonical_ids: dict[str, str] = {}
+    creator_ids: list[str] = []
+    # Primary encoding info (convenience fields)
+    url: str  # Primary encoding URI
+    source_type: str  # Primary encoding source_type
+    # All encodings (where this content lives)
+    encodings: list[EncodingResponse] = []
+    score: float | None = None
+
+
+class ContentFeedResponse(BaseModel):
+    """Feed response using Content model."""
+    items: list[ContentResponse]
+    total_count: int
+    unseen_count: int
 
 
 class FeedResponse(BaseModel):
@@ -558,46 +603,23 @@ def poll_source(source_id: str):
         )
         new_items.append(item)
 
-    # Generate embeddings for new items (batched)
+    # Ingest items with unified pipeline (embeddings + persistence)
     if new_items:
-        import logging
+        from omnifeed.ingestion import get_ingestion_pipeline
+        pipeline = get_ingestion_pipeline(state.store)
+        pipeline.ingest(new_items, source_type=source.source_type)
 
-        # Text embeddings (title + description)
-        try:
-            from omnifeed.ranking.embeddings import get_embedding_service
-            embedding_service = get_embedding_service()
-            text_embeddings = embedding_service.embed_items(new_items)
-            for item, emb in zip(new_items, text_embeddings):
-                item.embeddings.append(emb)
-        except Exception as e:
-            logging.warning(f"Failed to generate text embeddings: {e}")
-
-        # Transcript embeddings for YouTube videos
-        if source.source_type in ("youtube_channel", "youtube_playlist"):
-            try:
-                from omnifeed.ranking.transcript_embeddings import embed_youtube_items
-                transcript_embeddings = embed_youtube_items(new_items)
-                for item in new_items:
-                    if item.id in transcript_embeddings:
-                        item.embeddings.append(transcript_embeddings[item.id])
-                logging.info(f"Generated {len(transcript_embeddings)} transcript embeddings")
-            except Exception as e:
-                logging.warning(f"Failed to generate transcript embeddings: {e}")
-
-    # Save items and create attributions
-    for item in new_items:
-        state.store.upsert_item(item)
-
-        # Create attribution linking this item to the source
-        attribution = ItemAttribution(
-            id=uuid.uuid4().hex[:12],
-            item_id=item.id,
-            source_id=source_id,
-            external_id=item.external_id,
-            is_primary=True,  # First source is primary
-            discovered_at=datetime.utcnow(),
-        )
-        state.store.upsert_attribution(attribution)
+        # Create attributions linking items to the source
+        for item in new_items:
+            attribution = ItemAttribution(
+                id=uuid.uuid4().hex[:12],
+                item_id=item.id,
+                source_id=source_id,
+                external_id=item.external_id,
+                is_primary=True,  # First source is primary
+                discovered_at=datetime.utcnow(),
+            )
+            state.store.upsert_attribution(attribution)
 
     state.store.update_source_poll_time(source_id, datetime.utcnow())
 
@@ -840,49 +862,51 @@ def list_search_providers():
 @app.get("/api/feed", response_model=FeedResponse)
 def get_feed(
     show_seen: bool = Query(False, description="Include seen items"),
-    source_id: str | None = Query(None, description="Filter by source"),
+    source_id: str | None = Query(None, description="Filter by source type"),
     objective: str | None = Query(None, description="Ranking objective (entertainment, curiosity, etc.)"),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ):
-    """Get the ranked feed."""
+    """Get the ranked feed.
+
+    Sources from Content+Encoding internally, returns ItemResponse for backwards compat.
+    """
     import logging
+    from omnifeed.ranking.pipeline import ContentRetriever
 
     seen_filter = None if show_seen else False
 
-    # Use pipeline's retrieve_and_rank to score ALL candidates
-    ranked, stats = state.pipeline.retrieve_and_rank(
+    # Use ContentRetriever (new model)
+    retriever = ContentRetriever()
+    contents, retrieval_stats = retriever.retrieve(
         store=state.store,
         seen=seen_filter,
         hidden=False,
-        source_id=source_id,
-        limit=limit + offset,  # Get enough for offset
-        objective=objective,
+        source_type=source_id,  # source_id param now maps to source_type
+        limit=limit + offset,
     )
 
-    # Apply offset
-    ranked = ranked[offset:]
+    # Score and sort
+    scored = [(c, state.pipeline.score(c, objective=objective)) for c in contents]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    scored = scored[offset:offset + limit]
 
-    # Log performance for monitoring
-    logging.info(
-        f"Feed request: {stats.scored_count} candidates, "
-        f"{stats.total_time_ms:.0f}ms total"
-    )
+    logging.info(f"Feed request: {len(contents)} candidates scored")
 
-    # Get source names
-    sources_map = {s.id: s for s in state.store.list_sources()}
-
-    # Build response with scores
+    # Build response (ItemResponse format for backwards compat)
     item_responses = []
-    for item in ranked:
-        score = state.pipeline.score(item, objective=objective)
+    for content, score in scored:
+        # Get primary encoding for source info
+        primary = state.store.get_primary_encoding(content.id)
+        source_type = primary.source_type if primary else ""
+        url = primary.uri if primary else ""
 
-        # Get attributions
-        attributions = state.store.get_attributions(item.id)
+        # Get attributions (still works - same IDs)
+        attributions = state.store.get_attributions(content.id)
         attr_responses = [
             AttributionResponse(
                 source_id=attr.source_id,
-                source_name=sources_map.get(attr.source_id, type("", (), {"display_name": "Unknown"})).display_name,
+                source_name=attr.source_id,  # Use source_type as name
                 discovered_at=attr.discovered_at,
                 rank=attr.rank,
                 context=attr.context,
@@ -890,28 +914,29 @@ def get_feed(
             for attr in attributions
         ]
 
+        # Map Content fields to ItemResponse
         item_responses.append(ItemResponse(
-            id=item.id,
-            source_id=item.source_id,
-            source_name=sources_map.get(item.source_id, type("", (), {"display_name": "Unknown"})).display_name,
-            url=item.url,
-            title=item.title,
-            creator_id=item.creator_id,
-            creator_name=item.creator_name,
-            published_at=item.published_at,
-            content_type=item.content_type.value,
-            seen=item.seen,
-            hidden=item.hidden,
-            metadata=item.metadata,
-            canonical_ids=item.canonical_ids,
+            id=content.id,
+            source_id=source_type,
+            source_name=source_type,
+            url=url,
+            title=content.title,
+            creator_id=content.creator_ids[0] if content.creator_ids else None,
+            creator_name="",  # Deprecated - use creator_ids
+            published_at=content.published_at,
+            content_type=content.content_type.value,
+            seen=content.seen,
+            hidden=content.hidden,
+            metadata=content.metadata,
+            canonical_ids=content.canonical_ids,
             attributions=attr_responses,
             score=round(score, 3),
         ))
 
     return FeedResponse(
         items=item_responses,
-        total_count=state.store.count_items(hidden=False),
-        unseen_count=state.store.count_items(seen=False, hidden=False),
+        total_count=state.store.count_content(hidden=False),
+        unseen_count=state.store.count_content(seen=False, hidden=False),
     )
 
 
@@ -986,6 +1011,81 @@ def get_rated_items(limit: int = 50, offset: int = 0):
     return RatedItemsResponse(items=rated_items, total_count=total)
 
 
+class QueueItemsResponse(BaseModel):
+    items: list[ItemResponse]
+    total_count: int
+
+
+@app.get("/api/feed/queue", response_model=QueueItemsResponse)
+def get_queue_items(limit: int = 100, offset: int = 0):
+    """Get items that were saved from Explore (explore_save feedback events)."""
+    import json
+    sources_map = {s.id: s for s in state.store.list_sources()}
+
+    # Query items with explore_save feedback events
+    cursor = state.store._conn.execute("""
+        SELECT DISTINCT
+            i.id, i.source_id, i.url, i.title, i.creator_id, i.creator_name,
+            i.published_at, i.content_type, i.seen, i.hidden, i.metadata, i.canonical_ids,
+            fe.timestamp as saved_at
+        FROM items i
+        JOIN feedback_events fe ON fe.item_id = i.id
+        WHERE fe.event_type = 'explore_save'
+        ORDER BY fe.timestamp DESC
+        LIMIT ? OFFSET ?
+    """, (limit, offset))
+
+    queue_items = []
+    for row in cursor.fetchall():
+        (item_id, source_id, url, title, creator_id, creator_name,
+         published_at, content_type, seen, hidden, metadata_json, canonical_ids_json,
+         saved_at) = row
+
+        source = sources_map.get(source_id)
+        item_response = ItemResponse(
+            id=item_id,
+            source_id=source_id,
+            source_name=source.display_name if source else "Discovered",
+            url=url,
+            title=title,
+            creator_id=creator_id,
+            creator_name=creator_name,
+            published_at=published_at,
+            content_type=content_type,
+            seen=bool(seen),
+            hidden=bool(hidden),
+            metadata=json.loads(metadata_json) if metadata_json else {},
+            canonical_ids=json.loads(canonical_ids_json) if canonical_ids_json else {},
+        )
+        queue_items.append(item_response)
+
+    # Get total count
+    cursor = state.store._conn.execute("""
+        SELECT COUNT(DISTINCT i.id)
+        FROM items i
+        JOIN feedback_events fe ON fe.item_id = i.id
+        WHERE fe.event_type = 'explore_save'
+    """)
+    total = cursor.fetchone()[0]
+
+    return QueueItemsResponse(items=queue_items, total_count=total)
+
+
+@app.delete("/api/feed/queue/{item_id}")
+def remove_from_queue(item_id: str):
+    """Remove an item from the queue (delete the explore_save feedback event)."""
+    cursor = state.store._conn.execute("""
+        DELETE FROM feedback_events
+        WHERE item_id = ? AND event_type = 'explore_save'
+    """, (item_id,))
+    state.store._conn.commit()
+
+    if cursor.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Item not in queue")
+
+    return {"status": "removed", "item_id": item_id}
+
+
 @app.get("/api/items/{item_id}", response_model=ItemResponse)
 def get_item(item_id: str):
     """Get a single item."""
@@ -1030,33 +1130,34 @@ def get_item(item_id: str):
 @app.post("/api/items/{item_id}/seen")
 def mark_item_seen(item_id: str):
     """Mark an item as seen."""
-    item = state.store.get_item(item_id)
-    if not item:
+    # Use Content (item_id == content_id after migration)
+    content = state.store.get_content(item_id)
+    if not content:
         raise HTTPException(status_code=404, detail="Item not found")
 
-    state.store.mark_seen(item_id, seen=True)
+    state.store.mark_content_seen(item_id, seen=True)
     return {"status": "seen"}
 
 
 @app.delete("/api/items/{item_id}/seen")
 def mark_item_unseen(item_id: str):
     """Mark an item as unseen."""
-    item = state.store.get_item(item_id)
-    if not item:
+    content = state.store.get_content(item_id)
+    if not content:
         raise HTTPException(status_code=404, detail="Item not found")
 
-    state.store.mark_seen(item_id, seen=False)
+    state.store.mark_content_seen(item_id, seen=False)
     return {"status": "unseen"}
 
 
 @app.post("/api/items/{item_id}/hide")
 def hide_item(item_id: str):
     """Hide an item."""
-    item = state.store.get_item(item_id)
-    if not item:
+    content = state.store.get_content(item_id)
+    if not content:
         raise HTTPException(status_code=404, detail="Item not found")
 
-    state.store.mark_hidden(item_id, hidden=True)
+    state.store.mark_content_hidden(item_id, hidden=True)
     return {"status": "hidden"}
 
 
@@ -1474,6 +1575,10 @@ def record_explicit_feedback(request: ExplicitFeedbackRequest):
 
     state.store.add_explicit_feedback(feedback)
 
+    # Propagate rating up the retriever chain
+    from omnifeed.retriever.scoring import record_content_feedback
+    record_content_feedback(state.store, item.source_id, feedback.reward_score)
+
     return ExplicitFeedbackResponse(
         id=feedback.id,
         item_id=feedback.item_id,
@@ -1669,63 +1774,37 @@ def refresh_embeddings(
     embedding_type: str = Query("text", description="Type of embedding to refresh"),
 ):
     """Regenerate embeddings for items."""
-    import logging
-    from omnifeed.ranking.embeddings import get_embedding_by_type
+    from omnifeed.ingestion import get_ingestion_pipeline
 
-    items = state.store.get_items(source_id=source_id, limit=10000)
-
-    # Filter items needing embeddings
-    if force:
-        to_embed = items
-    else:
-        to_embed = [
-            item for item in items
-            if not get_embedding_by_type(item.embeddings, embedding_type)
-        ]
-
-    if not to_embed:
-        return RefreshEmbeddingsResponse(updated_count=0, skipped_count=len(items), failed_count=0)
-
-    updated = 0
-    failed = 0
-
-    try:
-        from omnifeed.ranking.embeddings import get_embedding_service
-        embedding_service = get_embedding_service()
-
-        # Batch embed
-        new_embeddings = embedding_service.embed_items(to_embed)
-
-        for item, emb in zip(to_embed, new_embeddings):
-            try:
-                # Remove old embedding of same type if exists
-                item.embeddings = [e for e in item.embeddings if e.get("type") != embedding_type]
-                item.embeddings.append(emb)
-                state.store.upsert_item(item)
-                updated += 1
-            except Exception as e:
-                logging.warning(f"Failed to save embedding for {item.id}: {e}")
-                failed += 1
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Embedding generation failed: {e}")
+    pipeline = get_ingestion_pipeline(state.store)
+    result = pipeline.refresh_embeddings(
+        source_id=source_id,
+        embedding_type=embedding_type,
+        force=force,
+    )
 
     return RefreshEmbeddingsResponse(
-        updated_count=updated,
-        skipped_count=len(items) - len(to_embed),
-        failed_count=failed,
+        updated_count=result["updated_count"],
+        skipped_count=result["skipped_count"],
+        failed_count=result["failed_count"],
     )
 
 
 @app.post("/api/model/refresh-transcripts", response_model=RefreshEmbeddingsResponse)
 def refresh_transcript_embeddings(
     source_id: str | None = Query(None, description="Only refresh items from this source"),
-    force: bool = Query(False, description="Regenerate even if transcript embedding exists"),
+    force: bool = Query(False, description="Regenerate even if content already has transcript"),
 ):
-    """Generate transcript embeddings for YouTube videos."""
+    """Enrich YouTube items with transcripts and regenerate embeddings.
+
+    This endpoint:
+    1. Fetches transcripts for YouTube videos
+    2. Adds transcript text to content_text metadata
+    3. Regenerates text embeddings to include transcript content
+    """
     import logging
-    from omnifeed.ranking.embeddings import get_embedding_by_type
-    from omnifeed.ranking.transcript_embeddings import embed_transcript
+    from omnifeed.sources.youtube.adapter import enrich_with_transcript
+    from omnifeed.featurization import get_embedding_service
 
     # Get YouTube items
     items = state.store.get_items(source_id=source_id, limit=10000)
@@ -1739,59 +1818,55 @@ def refresh_transcript_embeddings(
     if not youtube_items:
         return RefreshEmbeddingsResponse(updated_count=0, skipped_count=len(items), failed_count=0)
 
-    # Filter items needing transcript embeddings
+    # Filter items needing transcript enrichment
     if force:
-        to_embed = youtube_items
+        to_enrich = youtube_items
     else:
-        to_embed = [
+        # Skip items that already have substantial content_text (likely already enriched)
+        to_enrich = [
             item for item in youtube_items
-            if not get_embedding_by_type(item.embeddings, "transcript")
+            if len(item.metadata.get("content_text", "")) < 500
         ]
 
-    if not to_embed:
+    if not to_enrich:
         return RefreshEmbeddingsResponse(
             updated_count=0,
             skipped_count=len(youtube_items),
             failed_count=0,
         )
 
+    # Enrich with transcripts
+    enriched_count = enrich_with_transcript(to_enrich)
+    logging.info(f"Enriched {enriched_count} items with transcripts")
+
+    # Regenerate text embeddings for enriched items
     updated = 0
     failed = 0
-    no_transcript = 0
 
-    for item in to_embed:
-        video_id = item.metadata.get("video_id")
-        if not video_id:
-            # Extract from URL
-            import re
-            match = re.search(r'youtube\.com/watch\?v=([^&]+)', item.url)
-            if match:
-                video_id = match.group(1)
-
-        if not video_id:
-            failed += 1
-            continue
+    if enriched_count > 0:
+        embedding_service = get_embedding_service()
+        enriched_items = [
+            item for item in to_enrich
+            if len(item.metadata.get("content_text", "")) >= 500
+        ]
 
         try:
-            emb = embed_transcript(video_id)
-            if emb:
-                # Remove old transcript embedding if exists
-                item.embeddings = [e for e in item.embeddings if e.get("type") != "transcript"]
+            embeddings = embedding_service.embed_items(enriched_items)
+            for item, emb in zip(enriched_items, embeddings):
+                # Remove old text embedding and add new one
+                item.embeddings = [e for e in item.embeddings if e.get("type") != "text"]
                 item.embeddings.append(emb)
                 state.store.upsert_item(item)
                 updated += 1
-                logging.info(f"Transcript embedding for: {item.title[:40]}")
-            else:
-                no_transcript += 1
         except Exception as e:
-            logging.warning(f"Failed transcript for {item.id}: {e}")
-            failed += 1
+            logging.warning(f"Failed to regenerate embeddings: {e}")
+            failed = len(enriched_items)
 
-    logging.info(f"Transcript embeddings: {updated} updated, {no_transcript} no transcript, {failed} failed")
+    logging.info(f"Transcript refresh: {updated} updated, {len(to_enrich) - enriched_count} no transcript, {failed} failed")
 
     return RefreshEmbeddingsResponse(
         updated_count=updated,
-        skipped_count=len(youtube_items) - len(to_embed) + no_transcript,
+        skipped_count=len(youtube_items) - len(to_enrich) + (len(to_enrich) - enriched_count),
         failed_count=failed,
     )
 
@@ -2349,6 +2424,10 @@ def submit_extension_rating(request: ExtensionRatingRequest):
     )
     state.store.add_explicit_feedback(feedback)
 
+    # Propagate rating up the retriever chain
+    from omnifeed.retriever.scoring import record_content_feedback
+    record_content_feedback(state.store, item.source_id, feedback.reward_score)
+
     return ExtensionRatingResponse(
         feedback_id=feedback.id,
         item_id=item.id,
@@ -2383,6 +2462,926 @@ def upload_extension_media(request: MediaUploadRequest):
         matched=False,
         item_id=None,
         confidence=0.0,
+    )
+
+
+# =============================================================================
+# Routes: Explore (Retriever-based source discovery)
+# =============================================================================
+
+
+class RetrieverResponse(BaseModel):
+    id: str
+    display_name: str
+    kind: str
+    handler_type: str
+    uri: str
+    score: float | None = None
+    confidence: float | None = None
+    is_enabled: bool = True
+
+
+class ExploreResultResponse(BaseModel):
+    retrievers: list[RetrieverResponse]
+    items: list[ItemResponse]
+    topic: str | None = None
+
+
+def _select_strategies(
+    all_strategies: list,
+    store,
+    max_strategies: int = 4,
+    explore_ratio: float = 0.3,
+) -> list:
+    """Select strategies using explore/exploit balance.
+
+    - Exploit: Prefer high-scoring strategies with good confidence
+    - Explore: Include some low-confidence strategies to gather data
+    - Skip: Avoid strategies with no retriever (never been run)
+    """
+    import random
+
+    # Get retriever info for each strategy
+    strategy_data = []
+    for strategy in all_strategies:
+        uri = f"strategy:{strategy.strategy_id}"
+        retriever = store.get_retriever_by_uri(uri)
+
+        if retriever and retriever.score:
+            strategy_data.append({
+                'strategy': strategy,
+                'score': retriever.score.value,
+                'confidence': retriever.score.confidence,
+                'sample_size': retriever.score.sample_size,
+            })
+        else:
+            # No data yet - candidate for exploration
+            strategy_data.append({
+                'strategy': strategy,
+                'score': None,
+                'confidence': 0.0,
+                'sample_size': 0,
+            })
+
+    # Separate into exploit (high confidence) and explore (low confidence) pools
+    exploit_pool = [s for s in strategy_data if s['confidence'] >= 0.3]
+    explore_pool = [s for s in strategy_data if s['confidence'] < 0.3]
+
+    # Sort exploit pool by score (descending)
+    exploit_pool.sort(key=lambda x: x['score'] or 0, reverse=True)
+
+    # Calculate how many from each pool
+    n_exploit = int(max_strategies * (1 - explore_ratio))
+    n_explore = max_strategies - n_exploit
+
+    selected = []
+
+    # Take top performers from exploit pool
+    selected.extend([s['strategy'] for s in exploit_pool[:n_exploit]])
+
+    # Randomly sample from explore pool
+    if explore_pool and n_explore > 0:
+        explore_sample = random.sample(explore_pool, min(n_explore, len(explore_pool)))
+        selected.extend([s['strategy'] for s in explore_sample])
+
+    # If we don't have enough, fill from whatever is available
+    if len(selected) < max_strategies:
+        remaining = [s['strategy'] for s in strategy_data if s['strategy'] not in selected]
+        needed = max_strategies - len(selected)
+        selected.extend(remaining[:needed])
+
+    logger.info(f"[SELECT] Selected {len(selected)} strategies: {[s.strategy_id for s in selected]}")
+    return selected
+
+
+@app.post("/api/explore", response_model=ExploreResultResponse)
+async def explore_sources(
+    topic: str | None = Query(None, description="Topic to explore (random if not provided)"),
+    limit: int = Query(9, ge=1, le=20, description="Max total items to return"),
+    strategy_ids: str | None = Query(None, description="Comma-separated strategy IDs to use (uses all if not provided)"),
+):
+    """Discover new sources and content via exploration strategies.
+
+    Uses registered exploration strategies to discover NEW sources.
+    Each strategy represents a specific query/prompt construction method.
+    Strategies are scored based on the quality of sources they discover.
+    """
+    from omnifeed.retriever import RetrieverOrchestrator, RetrievalContext, find_handler
+    from omnifeed.retriever.handlers.strategy import get_all_strategies, get_strategy
+    from omnifeed.retriever.scoring import RetrieverScorer
+
+    logger.info(f"=== EXPLORE START === topic={topic}, limit={limit}, strategies={strategy_ids}")
+
+    orchestrator = RetrieverOrchestrator(state.store)
+    scorer = RetrieverScorer(state.store)
+
+    # Determine which strategies to use
+    if strategy_ids:
+        selected_strategy_ids = [s.strip() for s in strategy_ids.split(",")]
+        strategies = [get_strategy(sid) for sid in selected_strategy_ids if get_strategy(sid)]
+    else:
+        # Select strategies using explore/exploit balance
+        all_strategies = get_all_strategies()
+        strategies = _select_strategies(
+            all_strategies,
+            state.store,
+            max_strategies=4,  # Only run 4 strategies max
+            explore_ratio=0.3,  # 30% exploration
+        )
+
+    if not strategies:
+        logger.error("No strategies available!")
+        return ExploreResultResponse(retrievers=[], items=[], topic=topic)
+
+    logger.info(f"[1] Using {len(strategies)} strategies: {[s.strategy_id for s in strategies]}")
+
+    # Get or create retriever for each strategy
+    handler = find_handler("strategy:")
+    if not handler:
+        logger.error("[1] No strategy handler found!")
+        return ExploreResultResponse(retrievers=[], items=[], topic=topic)
+
+    # Fetch context items for LLM strategies (once, outside loop)
+    context_items = None
+    try:
+        feedbacks = state.store.get_explicit_feedback(limit=50)
+        high_rated = [f for f in feedbacks if f.reward_score >= 4.0]
+        if high_rated:
+            item_ids = [f.item_id for f in high_rated[:10]]
+            items_list = [state.store.get_item(iid) for iid in item_ids]
+            context_items = [
+                {"title": i.title, "creator_name": i.creator_name, "url": i.url}
+                for i in items_list if i
+            ]
+            logger.info(f"[CTX] Built context with {len(context_items)} high-rated items")
+    except Exception as e:
+        logger.debug(f"Could not fetch context items: {e}")
+
+    # Prepare strategy retrievers
+    strategy_retrievers = []
+    for strategy in strategies:
+        strategy_uri = f"strategy:{strategy.strategy_id}"
+        existing = state.store.get_retriever_by_uri(strategy_uri)
+        if existing:
+            strategy_retrievers.append((strategy, existing))
+        else:
+            new_retriever = handler.resolve(strategy_uri)
+            new_retriever = state.store.add_retriever(new_retriever)
+            strategy_retrievers.append((strategy, new_retriever))
+
+    # Run all strategies IN PARALLEL
+    async def invoke_strategy(strategy, retriever):
+        context = RetrievalContext(
+            max_depth=1,  # Recurse once to get content from discovered sources
+            max_results=2,  # Limit sources per strategy
+            explore_ratio=0.7,
+            topic=topic,
+            context_items=context_items,
+        )
+        try:
+            result = await orchestrator.invoke(retriever, context)
+            logger.info(f"[PARALLEL] {strategy.strategy_id}: {len(result.new_retrievers)} retrievers, {len(result.items)} items")
+            return result
+        except Exception as e:
+            logger.error(f"[PARALLEL] {strategy.strategy_id} failed: {e}")
+            return None
+
+    logger.info(f"[2] Running {len(strategy_retrievers)} strategies in parallel...")
+    results = await asyncio.gather(*[
+        invoke_strategy(s, r) for s, r in strategy_retrievers
+    ])
+
+    # Aggregate results
+    all_retrievers = []
+    all_items = []
+    for result in results:
+        if result:
+            all_retrievers.extend(result.new_retrievers)
+            all_items.extend(result.items)
+
+    # Dedupe retrievers by URI
+    seen_uris = set()
+    unique_retrievers = []
+    for r in all_retrievers:
+        if r.uri not in seen_uris:
+            seen_uris.add(r.uri)
+            unique_retrievers.append(r)
+
+    logger.info(f"[5] Total: {len(unique_retrievers)} unique retrievers, {len(all_items)} items")
+    result_retrievers = unique_retrievers[:limit]
+    result_items = all_items[:limit]
+
+    # Create a fake result object for compatibility with rest of function
+    class AggregatedResult:
+        def __init__(self, retrievers, items):
+            self.new_retrievers = retrievers
+            self.items = items
+            self.errors = []
+
+    result = AggregatedResult(result_retrievers, result_items)
+
+    logger.info(f"[4] Orchestrator returned: {len(result.new_retrievers)} retrievers, {len(result.items)} items, {len(result.errors)} errors")
+    for err_uri, err in result.errors:
+        logger.error(f"[4] Error for {err_uri}: {err}")
+
+    # Build retriever responses
+    retriever_responses = []
+    for r in result.new_retrievers[:limit]:
+        retriever_responses.append(RetrieverResponse(
+            id=r.id,
+            display_name=r.display_name,
+            kind=r.kind.value,
+            handler_type=r.handler_type,
+            uri=r.uri,
+            score=r.score.value if r.score else None,
+            confidence=r.score.confidence if r.score else None,
+            is_enabled=r.is_enabled,
+        ))
+
+    # Ingest discovered items with unified pipeline (embeddings + persistence)
+    if result.items:
+        from omnifeed.ingestion import get_ingestion_pipeline
+        pipeline = get_ingestion_pipeline(state.store)
+        pipeline.ingest(result.items)
+        logger.info(f"[5] Ingested {len(result.items)} discovered items")
+
+    # Build item responses from discovered content
+    item_responses = []
+    sources_map = {s.id: s for s in state.store.list_sources()}
+
+    for item in result.items[:limit]:
+        source = sources_map.get(item.source_id)
+        item_responses.append(ItemResponse(
+            id=item.id,
+            source_id=item.source_id,
+            source_name=source.display_name if source else "Discovered",
+            url=item.url,
+            title=item.title,
+            creator_id=item.creator_id,
+            creator_name=item.creator_name,
+            published_at=item.published_at,
+            content_type=item.content_type.value,
+            seen=item.seen,
+            hidden=item.hidden,
+            metadata=item.metadata,
+            canonical_ids=item.canonical_ids,
+            score=state.pipeline.score(item),
+        ))
+
+    return ExploreResultResponse(
+        retrievers=retriever_responses,
+        items=item_responses,
+        topic=topic,
+    )
+
+
+async def _explore_discovery_only(topic: str | None, limit: int) -> ExploreResultResponse:
+    """Fallback when no sources exist - just do discovery."""
+    from omnifeed.retriever import RetrieverOrchestrator, RetrievalContext, get_handler
+
+    orchestrator = RetrieverOrchestrator(state.store)
+    context = RetrievalContext(max_depth=1, max_results=limit, explore_ratio=0.7)
+
+    if topic:
+        explore_uri = f"explore:topic:{topic}"
+    else:
+        explore_uri = "explore:random"
+
+    handler = get_handler("exploratory")
+    if not handler:
+        return ExploreResultResponse(retrievers=[], items=[], topic=topic)
+
+    explore_retriever = handler.resolve(explore_uri)
+    existing = state.store.get_retriever_by_uri(explore_uri)
+    if existing:
+        explore_retriever = existing
+    else:
+        explore_retriever = state.store.add_retriever(explore_retriever)
+
+    result = await orchestrator.invoke(explore_retriever, context)
+
+    retriever_responses = []
+    for r in result.new_retrievers[:limit]:
+        retriever_responses.append(RetrieverResponse(
+            id=r.id,
+            display_name=r.display_name,
+            kind=r.kind.value,
+            handler_type=r.handler_type,
+            uri=r.uri,
+            score=r.score.value if r.score else None,
+            confidence=r.score.confidence if r.score else None,
+            is_enabled=r.is_enabled,
+        ))
+
+    return ExploreResultResponse(
+        retrievers=retriever_responses,
+        items=[],
+        topic=topic,
+    )
+
+
+@app.get("/api/explore/stream")
+async def explore_stream(
+    topic: str | None = Query(None, description="Topic to explore"),
+    limit: int = Query(9, ge=1, le=20),
+    strategy_ids: str | None = Query(None),
+):
+    """Stream explore progress via Server-Sent Events.
+
+    Events:
+    - strategy_start: {strategy_id, display_name}
+    - llm_prompt: {strategy_id, prompt}
+    - llm_response: {strategy_id, queries}
+    - search_start: {strategy_id, query, provider}
+    - search_result: {strategy_id, count, provider}
+    - strategy_complete: {strategy_id, retrievers, items}
+    - complete: {total_retrievers, total_items}
+    - error: {message}
+    """
+    from omnifeed.retriever import RetrieverOrchestrator, RetrievalContext, find_handler
+    from omnifeed.retriever.handlers.strategy import get_all_strategies, get_strategy
+
+    async def event_generator():
+        try:
+            # Determine strategies
+            if strategy_ids:
+                selected_ids = [s.strip() for s in strategy_ids.split(",")]
+                strategies = [get_strategy(sid) for sid in selected_ids if get_strategy(sid)]
+            else:
+                # Use explore/exploit selection
+                all_strategies = get_all_strategies()
+                strategies = _select_strategies(
+                    all_strategies,
+                    state.store,
+                    max_strategies=4,
+                    explore_ratio=0.3,
+                )
+
+            if not strategies:
+                yield f"data: {json.dumps({'event': 'error', 'message': 'No strategies available'})}\n\n"
+                return
+
+            yield f"data: {json.dumps({'event': 'start', 'strategies': [s.strategy_id for s in strategies], 'topic': topic})}\n\n"
+
+            orchestrator = RetrieverOrchestrator(state.store)
+            handler = find_handler("strategy:")
+            if not handler:
+                yield f"data: {json.dumps({'event': 'error', 'message': 'No strategy handler'})}\n\n"
+                return
+
+            all_retrievers = []
+            all_items = []
+            results_per_strategy = max(1, limit // len(strategies))
+
+            # Fetch context for LLM strategies
+            context_items = None
+            try:
+                feedbacks = state.store.get_explicit_feedback(limit=50)
+                high_rated = [f for f in feedbacks if f.reward_score >= 4.0]
+                if high_rated:
+                    item_ids = [f.item_id for f in high_rated[:10]]
+                    items = [state.store.get_item(iid) for iid in item_ids]
+                    context_items = [
+                        {"title": i.title, "creator_name": i.creator_name, "url": i.url}
+                        for i in items if i
+                    ]
+            except Exception:
+                pass
+
+            # Prepare strategy retrievers
+            strategy_retrievers = []
+            for strategy in strategies:
+                strategy_uri = f"strategy:{strategy.strategy_id}"
+                existing = state.store.get_retriever_by_uri(strategy_uri)
+                if existing:
+                    strategy_retrievers.append((strategy, existing))
+                else:
+                    new_retriever = handler.resolve(strategy_uri)
+                    new_retriever = state.store.add_retriever(new_retriever)
+                    strategy_retrievers.append((strategy, new_retriever))
+
+            yield f"data: {json.dumps({'event': 'running', 'message': f'Running {len(strategy_retrievers)} strategies in parallel...'})}\n\n"
+
+            # Run all strategies IN PARALLEL
+            async def invoke_one(strategy, retriever):
+                context = RetrievalContext(
+                    max_depth=1,  # Recurse once to get content
+                    max_results=2,
+                    explore_ratio=0.7,
+                    topic=topic,
+                    context_items=context_items,
+                )
+                try:
+                    return strategy.strategy_id, await orchestrator.invoke(retriever, context)
+                except Exception as e:
+                    return strategy.strategy_id, None
+
+            results = await asyncio.gather(*[
+                invoke_one(s, r) for s, r in strategy_retrievers
+            ])
+
+            # Report results
+            for strategy_id, result in results:
+                if result:
+                    yield f"data: {json.dumps({'event': 'strategy_complete', 'strategy_id': strategy_id, 'retrievers': len(result.new_retrievers), 'items': len(result.items)})}\n\n"
+                    all_retrievers.extend(result.new_retrievers)
+                    all_items.extend(result.items)
+                else:
+                    yield f"data: {json.dumps({'event': 'strategy_complete', 'strategy_id': strategy_id, 'retrievers': 0, 'items': 0, 'failed': True})}\n\n"
+
+            # Dedupe
+            seen_uris = set()
+            unique_retrievers = []
+            for r in all_retrievers:
+                if r.uri not in seen_uris:
+                    seen_uris.add(r.uri)
+                    unique_retrievers.append(r)
+
+            yield f"data: {json.dumps({'event': 'complete', 'total_retrievers': len(unique_retrievers), 'total_items': len(all_items)})}\n\n"
+
+        except Exception as e:
+            logger.exception("Explore stream error")
+            yield f"data: {json.dumps({'event': 'error', 'message': str(e)})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@app.get("/api/retrievers", response_model=list[RetrieverResponse])
+def list_retrievers(
+    kind: str | None = Query(None, description="Filter by kind (poll, explore, hybrid)"),
+    enabled_only: bool = Query(True, description="Only enabled retrievers"),
+    limit: int = Query(50, ge=1, le=200),
+):
+    """List all retrievers."""
+    retrievers = state.store.list_retrievers(
+        kind=kind,
+        enabled_only=enabled_only,
+        limit=limit,
+    )
+
+    return [
+        RetrieverResponse(
+            id=r.id,
+            display_name=r.display_name,
+            kind=r.kind.value,
+            handler_type=r.handler_type,
+            uri=r.uri,
+            score=r.score.value if r.score else None,
+            confidence=r.score.confidence if r.score else None,
+            is_enabled=r.is_enabled,
+        )
+        for r in retrievers
+    ]
+
+
+@app.get("/api/retrievers/top", response_model=list[RetrieverResponse])
+def get_top_retrievers(
+    limit: int = Query(10, ge=1, le=50),
+    min_confidence: float = Query(0.3, ge=0.0, le=1.0),
+):
+    """Get top-scoring retrievers."""
+    from omnifeed.retriever import RetrieverScorer
+
+    scorer = RetrieverScorer(state.store)
+    top = scorer.get_top_retrievers(limit=limit, min_confidence=min_confidence)
+
+    return [
+        RetrieverResponse(
+            id=r.id,
+            display_name=r.display_name,
+            kind=r.kind.value,
+            handler_type=r.handler_type,
+            uri=r.uri,
+            score=r.score.value if r.score else None,
+            confidence=r.score.confidence if r.score else None,
+            is_enabled=r.is_enabled,
+        )
+        for r in top
+    ]
+
+
+class AddRetrieverRequest(BaseModel):
+    uri: str
+    display_name: str | None = None
+
+
+@app.post("/api/retrievers", response_model=RetrieverResponse)
+def add_retriever(request: AddRetrieverRequest):
+    """Add a retriever from a URI."""
+    from omnifeed.retriever import find_handler
+
+    handler = find_handler(request.uri)
+    if not handler:
+        raise HTTPException(status_code=400, detail=f"No handler found for URI: {request.uri}")
+
+    try:
+        retriever = handler.resolve(request.uri, display_name=request.display_name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Check if exists
+    existing = state.store.get_retriever_by_uri(retriever.uri)
+    if existing:
+        raise HTTPException(status_code=409, detail="Retriever already exists")
+
+    retriever = state.store.add_retriever(retriever)
+
+    return RetrieverResponse(
+        id=retriever.id,
+        display_name=retriever.display_name,
+        kind=retriever.kind.value,
+        handler_type=retriever.handler_type,
+        uri=retriever.uri,
+        score=retriever.score.value if retriever.score else None,
+        confidence=retriever.score.confidence if retriever.score else None,
+        is_enabled=retriever.is_enabled,
+    )
+
+
+@app.delete("/api/retrievers/{retriever_id}")
+def delete_retriever(retriever_id: str):
+    """Delete a retriever."""
+    retriever = state.store.get_retriever(retriever_id)
+    if not retriever:
+        raise HTTPException(status_code=404, detail="Retriever not found")
+
+    count = state.store.delete_retriever(retriever_id)
+    return {"status": "deleted", "count": count}
+
+
+# =============================================================================
+# Control Plane: Retriever Details & Hierarchy
+# =============================================================================
+
+
+class RetrieverDetailResponse(BaseModel):
+    id: str
+    display_name: str
+    kind: str
+    handler_type: str
+    uri: str
+    config: dict = {}
+    parent_id: str | None = None
+    depth: int = 0
+    is_enabled: bool
+    score: float | None = None
+    confidence: float | None = None
+    sample_size: int | None = None
+    last_updated: datetime | None = None
+    last_invoked_at: datetime | None = None
+    created_at: datetime | None = None
+    children_count: int = 0
+
+
+class RetrieverHierarchyNode(BaseModel):
+    id: str
+    display_name: str
+    kind: str
+    handler_type: str
+    score: float | None = None
+    confidence: float | None = None
+    sample_size: int | None = None
+    is_enabled: bool
+    children: list["RetrieverHierarchyNode"] = []
+
+
+@app.get("/api/retrievers/hierarchy", response_model=list[RetrieverHierarchyNode])
+def get_retriever_hierarchy():
+    """Get full retriever hierarchy (tree view)."""
+    all_retrievers = state.store.list_retrievers(enabled_only=False, limit=500)
+
+    # Build lookup maps
+    by_id = {r.id: r for r in all_retrievers}
+    children_map: dict[str | None, list] = {None: []}
+    for r in all_retrievers:
+        if r.parent_id not in children_map:
+            children_map[r.parent_id] = []
+        children_map[r.parent_id].append(r)
+
+    def build_node(r) -> RetrieverHierarchyNode:
+        return RetrieverHierarchyNode(
+            id=r.id,
+            display_name=r.display_name,
+            kind=r.kind.value,
+            handler_type=r.handler_type,
+            score=r.score.value if r.score else None,
+            confidence=r.score.confidence if r.score else None,
+            sample_size=r.score.sample_size if r.score else None,
+            is_enabled=r.is_enabled,
+            children=[build_node(c) for c in children_map.get(r.id, [])],
+        )
+
+    # Build tree from roots (parent_id is None)
+    roots = children_map.get(None, [])
+    return [build_node(r) for r in roots]
+
+
+@app.get("/api/retrievers/{retriever_id}", response_model=RetrieverDetailResponse)
+def get_retriever_detail(retriever_id: str):
+    """Get detailed info for a single retriever."""
+    retriever = state.store.get_retriever(retriever_id)
+    if not retriever:
+        raise HTTPException(status_code=404, detail="Retriever not found")
+
+    children = state.store.get_children(retriever_id)
+
+    return RetrieverDetailResponse(
+        id=retriever.id,
+        display_name=retriever.display_name,
+        kind=retriever.kind.value,
+        handler_type=retriever.handler_type,
+        uri=retriever.uri,
+        config=retriever.config,
+        parent_id=retriever.parent_id,
+        depth=retriever.depth,
+        is_enabled=retriever.is_enabled,
+        score=retriever.score.value if retriever.score else None,
+        confidence=retriever.score.confidence if retriever.score else None,
+        sample_size=retriever.score.sample_size if retriever.score else None,
+        last_updated=retriever.score.last_updated if retriever.score else None,
+        last_invoked_at=retriever.last_invoked_at,
+        created_at=retriever.created_at,
+        children_count=len(children),
+    )
+
+
+@app.get("/api/retrievers/{retriever_id}/children", response_model=list[RetrieverDetailResponse])
+def get_retriever_children(retriever_id: str):
+    """Get child retrievers (for hierarchy view)."""
+    retriever = state.store.get_retriever(retriever_id)
+    if not retriever:
+        raise HTTPException(status_code=404, detail="Retriever not found")
+
+    children = state.store.get_children(retriever_id)
+
+    return [
+        RetrieverDetailResponse(
+            id=r.id,
+            display_name=r.display_name,
+            kind=r.kind.value,
+            handler_type=r.handler_type,
+            uri=r.uri,
+            config=r.config,
+            parent_id=r.parent_id,
+            depth=r.depth,
+            is_enabled=r.is_enabled,
+            score=r.score.value if r.score else None,
+            confidence=r.score.confidence if r.score else None,
+            sample_size=r.score.sample_size if r.score else None,
+            last_updated=r.score.last_updated if r.score else None,
+            last_invoked_at=r.last_invoked_at,
+            created_at=r.created_at,
+            children_count=len(state.store.get_children(r.id)),
+        )
+        for r in children
+    ]
+
+
+class UpdateRetrieverRequest(BaseModel):
+    is_enabled: bool | None = None
+    display_name: str | None = None
+    config: dict | None = None
+
+
+@app.patch("/api/retrievers/{retriever_id}", response_model=RetrieverDetailResponse)
+def update_retriever(retriever_id: str, request: UpdateRetrieverRequest):
+    """Update retriever settings (enable/disable, config, name)."""
+    retriever = state.store.get_retriever(retriever_id)
+    if not retriever:
+        raise HTTPException(status_code=404, detail="Retriever not found")
+
+    if request.is_enabled is not None:
+        state.store.enable_retriever(retriever_id, request.is_enabled)
+
+    if request.display_name is not None:
+        retriever.display_name = request.display_name
+
+    if request.config is not None:
+        retriever.config.update(request.config)
+
+    if request.display_name is not None or request.config is not None:
+        state.store.update_retriever(retriever)
+
+    # Re-fetch updated retriever
+    retriever = state.store.get_retriever(retriever_id)
+    children = state.store.get_children(retriever_id)
+
+    return RetrieverDetailResponse(
+        id=retriever.id,
+        display_name=retriever.display_name,
+        kind=retriever.kind.value,
+        handler_type=retriever.handler_type,
+        uri=retriever.uri,
+        config=retriever.config,
+        parent_id=retriever.parent_id,
+        depth=retriever.depth,
+        is_enabled=retriever.is_enabled,
+        score=retriever.score.value if retriever.score else None,
+        confidence=retriever.score.confidence if retriever.score else None,
+        sample_size=retriever.score.sample_size if retriever.score else None,
+        last_updated=retriever.score.last_updated if retriever.score else None,
+        last_invoked_at=retriever.last_invoked_at,
+        created_at=retriever.created_at,
+        children_count=len(children),
+    )
+
+
+# =============================================================================
+# Strategies API
+# =============================================================================
+
+
+class StrategyResponse(BaseModel):
+    strategy_id: str
+    display_name: str
+    description: str
+    provider: str
+    method: str
+    retriever_id: str | None = None  # If instantiated as a retriever
+    score: float | None = None
+    confidence: float | None = None
+    sample_size: int | None = None
+    is_enabled: bool = True
+
+
+@app.get("/api/strategies", response_model=list[StrategyResponse])
+def list_strategies():
+    """List all available exploration strategies with their scores."""
+    from omnifeed.retriever.handlers.strategy import get_all_strategies
+
+    strategies = get_all_strategies()
+    responses = []
+
+    for strategy in strategies:
+        # Check if there's a retriever for this strategy
+        strategy_uri = f"strategy:{strategy.strategy_id}"
+        retriever = state.store.get_retriever_by_uri(strategy_uri)
+
+        responses.append(StrategyResponse(
+            strategy_id=strategy.strategy_id,
+            display_name=strategy.display_name,
+            description=strategy.description,
+            provider=strategy.provider,
+            method=strategy.method,
+            retriever_id=retriever.id if retriever else None,
+            score=retriever.score.value if retriever and retriever.score else None,
+            confidence=retriever.score.confidence if retriever and retriever.score else None,
+            sample_size=retriever.score.sample_size if retriever and retriever.score else None,
+            is_enabled=retriever.is_enabled if retriever else True,
+        ))
+
+    return responses
+
+
+@app.post("/api/strategies/{strategy_id}/enable")
+def enable_strategy(strategy_id: str):
+    """Enable a strategy (creates retriever if needed)."""
+    from omnifeed.retriever.handlers.strategy import get_strategy
+    from omnifeed.retriever import find_handler
+
+    strategy = get_strategy(strategy_id)
+    if not strategy:
+        raise HTTPException(status_code=404, detail=f"Strategy not found: {strategy_id}")
+
+    strategy_uri = f"strategy:{strategy_id}"
+    retriever = state.store.get_retriever_by_uri(strategy_uri)
+
+    if retriever:
+        state.store.enable_retriever(retriever.id, True)
+    else:
+        # Create the retriever
+        handler = find_handler(strategy_uri)
+        if handler:
+            retriever = handler.resolve(strategy_uri)
+            retriever = state.store.add_retriever(retriever)
+
+    return {"status": "enabled", "retriever_id": retriever.id if retriever else None}
+
+
+@app.post("/api/strategies/{strategy_id}/disable")
+def disable_strategy(strategy_id: str):
+    """Disable a strategy."""
+    from omnifeed.retriever.handlers.strategy import get_strategy
+
+    strategy = get_strategy(strategy_id)
+    if not strategy:
+        raise HTTPException(status_code=404, detail=f"Strategy not found: {strategy_id}")
+
+    strategy_uri = f"strategy:{strategy_id}"
+    retriever = state.store.get_retriever_by_uri(strategy_uri)
+
+    if retriever:
+        state.store.enable_retriever(retriever.id, False)
+        return {"status": "disabled", "retriever_id": retriever.id}
+
+    return {"status": "not_instantiated"}
+
+
+# =============================================================================
+# Control Plane: Exploration Config
+# =============================================================================
+
+
+class ExplorationConfig(BaseModel):
+    explore_ratio: float = 0.3
+    min_exploit_confidence: float = 0.3
+    max_depth: int = 1
+    default_limit: int = 20
+
+
+# In-memory exploration config (could be persisted to DB later)
+_exploration_config = ExplorationConfig()
+
+
+@app.get("/api/exploration/config", response_model=ExplorationConfig)
+def get_exploration_config():
+    """Get current exploration configuration."""
+    return _exploration_config
+
+
+@app.put("/api/exploration/config", response_model=ExplorationConfig)
+def update_exploration_config(config: ExplorationConfig):
+    """Update exploration configuration."""
+    global _exploration_config
+
+    # Validate
+    if not 0.0 <= config.explore_ratio <= 1.0:
+        raise HTTPException(status_code=400, detail="explore_ratio must be between 0 and 1")
+    if not 0.0 <= config.min_exploit_confidence <= 1.0:
+        raise HTTPException(status_code=400, detail="min_exploit_confidence must be between 0 and 1")
+
+    _exploration_config = config
+    return _exploration_config
+
+
+class ExplorationStatsResponse(BaseModel):
+    total_retrievers: int
+    enabled_retrievers: int
+    scored_retrievers: int
+    unscored_retrievers: int
+    avg_score: float | None
+    avg_confidence: float | None
+    by_kind: dict[str, int]
+    by_handler: dict[str, int]
+    top_performers: list[RetrieverResponse]
+    needs_exploration: list[RetrieverResponse]
+
+
+@app.get("/api/exploration/stats", response_model=ExplorationStatsResponse)
+def get_exploration_stats():
+    """Get exploration system statistics."""
+    from omnifeed.retriever.scoring import RetrieverScorer
+
+    all_retrievers = state.store.list_retrievers(enabled_only=False, limit=500)
+    enabled = [r for r in all_retrievers if r.is_enabled]
+    scored = [r for r in all_retrievers if r.score is not None]
+    unscored = [r for r in all_retrievers if r.score is None]
+
+    # Aggregate stats
+    by_kind: dict[str, int] = {}
+    by_handler: dict[str, int] = {}
+    for r in all_retrievers:
+        by_kind[r.kind.value] = by_kind.get(r.kind.value, 0) + 1
+        by_handler[r.handler_type] = by_handler.get(r.handler_type, 0) + 1
+
+    avg_score = sum(r.score.value for r in scored) / len(scored) if scored else None
+    avg_confidence = sum(r.score.confidence for r in scored) / len(scored) if scored else None
+
+    # Get top performers and exploration candidates
+    scorer = RetrieverScorer(state.store)
+    top = scorer.get_top_retrievers(limit=5, min_confidence=0.1)
+    explore_candidates = scorer.get_exploration_candidates(limit=5, max_confidence=0.5)
+
+    def to_response(r):
+        return RetrieverResponse(
+            id=r.id,
+            display_name=r.display_name,
+            kind=r.kind.value,
+            handler_type=r.handler_type,
+            uri=r.uri,
+            score=r.score.value if r.score else None,
+            confidence=r.score.confidence if r.score else None,
+            is_enabled=r.is_enabled,
+        )
+
+    return ExplorationStatsResponse(
+        total_retrievers=len(all_retrievers),
+        enabled_retrievers=len(enabled),
+        scored_retrievers=len(scored),
+        unscored_retrievers=len(unscored),
+        avg_score=avg_score,
+        avg_confidence=avg_confidence,
+        by_kind=by_kind,
+        by_handler=by_handler,
+        top_performers=[to_response(r) for r in top],
+        needs_exploration=[to_response(r) for r in explore_candidates],
     )
 
 

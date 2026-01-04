@@ -287,3 +287,80 @@ export interface SitemapConfigPayload {
   fetch_content?: boolean;
   max_items?: number;
 }
+
+// Control Plane / Strategies
+
+export interface RetrieverDetail {
+  id: string;
+  display_name: string;
+  kind: string;
+  handler_type: string;
+  uri: string;
+  config: Record<string, unknown>;
+  parent_id: string | null;
+  depth: number;
+  is_enabled: boolean;
+  score: number | null;
+  confidence: number | null;
+  sample_size: number | null;
+  last_updated: string | null;
+  last_invoked_at: string | null;
+  created_at: string | null;
+  children_count: number;
+}
+
+export interface RetrieverHierarchyNode {
+  id: string;
+  display_name: string;
+  kind: string;
+  handler_type: string;
+  score: number | null;
+  confidence: number | null;
+  sample_size: number | null;
+  is_enabled: boolean;
+  children: RetrieverHierarchyNode[];
+}
+
+export interface ExplorationConfig {
+  explore_ratio: number;
+  min_exploit_confidence: number;
+  max_depth: number;
+  default_limit: number;
+}
+
+export interface RetrieverSummary {
+  id: string;
+  display_name: string;
+  kind: string;
+  handler_type: string;
+  uri: string;
+  score: number | null;
+  confidence: number | null;
+  is_enabled: boolean;
+}
+
+export interface ExplorationStats {
+  total_retrievers: number;
+  enabled_retrievers: number;
+  scored_retrievers: number;
+  unscored_retrievers: number;
+  avg_score: number | null;
+  avg_confidence: number | null;
+  by_kind: Record<string, number>;
+  by_handler: Record<string, number>;
+  top_performers: RetrieverSummary[];
+  needs_exploration: RetrieverSummary[];
+}
+
+export interface Strategy {
+  strategy_id: string;
+  display_name: string;
+  description: string;
+  provider: string;
+  method: string;
+  retriever_id: string | null;
+  score: number | null;
+  confidence: number | null;
+  sample_size: number | null;
+  is_enabled: boolean;
+}

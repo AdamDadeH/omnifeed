@@ -10,9 +10,9 @@ from omnifeed.models import (
     Source, SourceInfo, SourceStatus, Item, ContentType, ConsumptionType,
     FeedbackEvent, FeedbackDimension, FeedbackOption, ExplicitFeedback,
     ItemAttribution, Creator, CreatorType, CreatorStats, SourceStats,
-    Platform, PlatformCapability, DiscoverySource, DiscoverySignal,
-    PlatformInstance, ContentInfo, SignalType,
+    DiscoverySignal, ContentInfo, Content, Encoding, Embedding,
 )
+from omnifeed.retriever.types import Retriever, RetrieverKind, RetrieverScore
 from omnifeed.store.base import Store
 
 
@@ -134,45 +134,16 @@ CREATE TABLE IF NOT EXISTS creators (
 
 CREATE INDEX IF NOT EXISTS idx_creators_name ON creators(name COLLATE NOCASE);
 
--- Platform vs Discovery Source Architecture
-
-CREATE TABLE IF NOT EXISTS platforms (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    platform_type TEXT NOT NULL,
-    content_types JSON NOT NULL,
-    capabilities JSON NOT NULL,
-    auth_required INTEGER DEFAULT 0,
-    api_available INTEGER DEFAULT 0,
-    base_url TEXT,
-    url_patterns JSON,
-    metadata JSON,
-    created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS discovery_sources (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    source_type TEXT NOT NULL,
-    content_types JSON NOT NULL,
-    typical_platforms JSON,
-    poll_url TEXT,
-    poll_interval_seconds INTEGER DEFAULT 86400,
-    metadata JSON,
-    created_at TEXT NOT NULL,
-    last_polled_at TEXT
-);
+-- Discovery Signals (from discovery-type sources like RYM charts)
 
 CREATE TABLE IF NOT EXISTS discovery_signals (
     id TEXT PRIMARY KEY,
-    source_id TEXT NOT NULL REFERENCES discovery_sources(id),
+    source_id TEXT NOT NULL REFERENCES sources(id),
     item_id TEXT REFERENCES items(id),
     content_info JSON,
-    signal_type TEXT NOT NULL DEFAULT 'curated',
     rank INTEGER,
     rating REAL,
     context TEXT,
-    recommender TEXT,
     url TEXT,
     discovered_at TEXT NOT NULL,
     metadata JSON
@@ -182,25 +153,89 @@ CREATE INDEX IF NOT EXISTS idx_discovery_signals_source ON discovery_signals(sou
 CREATE INDEX IF NOT EXISTS idx_discovery_signals_item ON discovery_signals(item_id);
 CREATE INDEX IF NOT EXISTS idx_discovery_signals_unresolved ON discovery_signals(item_id) WHERE item_id IS NULL;
 
-CREATE TABLE IF NOT EXISTS platform_instances (
+-- Retrievers (recursive content discovery)
+
+CREATE TABLE IF NOT EXISTS retrievers (
     id TEXT PRIMARY KEY,
-    item_id TEXT NOT NULL REFERENCES items(id),
-    platform_id TEXT NOT NULL REFERENCES platforms(id),
-    platform_item_id TEXT NOT NULL,
-    url TEXT NOT NULL,
-    availability TEXT DEFAULT 'available',
-    quality_tiers JSON,
-    price REAL,
-    currency TEXT,
-    region_locks JSON,
-    match_confidence REAL DEFAULT 1.0,
-    discovered_at TEXT NOT NULL,
-    metadata JSON,
-    UNIQUE(item_id, platform_id)
+    display_name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    handler_type TEXT NOT NULL,
+    uri TEXT NOT NULL UNIQUE,
+    config JSON,
+    poll_interval_seconds INTEGER DEFAULT 3600,
+    last_invoked_at TEXT,
+    parent_id TEXT REFERENCES retrievers(id),
+    depth INTEGER DEFAULT 0,
+    is_enabled INTEGER DEFAULT 1,
+    score_value REAL,
+    score_confidence REAL,
+    score_sample_size INTEGER,
+    score_updated_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_platform_instances_item ON platform_instances(item_id);
-CREATE INDEX IF NOT EXISTS idx_platform_instances_platform ON platform_instances(platform_id);
+CREATE INDEX IF NOT EXISTS idx_retrievers_parent ON retrievers(parent_id);
+CREATE INDEX IF NOT EXISTS idx_retrievers_kind ON retrievers(kind);
+CREATE INDEX IF NOT EXISTS idx_retrievers_enabled ON retrievers(is_enabled);
+CREATE INDEX IF NOT EXISTS idx_retrievers_poll ON retrievers(kind, is_enabled, last_invoked_at)
+    WHERE kind = 'poll' AND is_enabled = 1;
+
+-- Source Scores (aggregated from item feedback)
+
+CREATE TABLE IF NOT EXISTS source_scores (
+    source_id TEXT PRIMARY KEY REFERENCES sources(id),
+    value REAL NOT NULL,
+    confidence REAL NOT NULL,
+    sample_size INTEGER NOT NULL,
+    last_updated TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_scores_value ON source_scores(value DESC);
+
+-- Content (abstract content - what it IS, not where it lives)
+-- Replaces Item model - same song can have multiple Encodings
+
+CREATE TABLE IF NOT EXISTS content (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    published_at TEXT NOT NULL,
+    ingested_at TEXT NOT NULL,
+    creator_ids JSON,
+    consumption_type TEXT DEFAULT 'one_shot',
+    canonical_ids JSON,
+    seen INTEGER DEFAULT 0,
+    hidden INTEGER DEFAULT 0,
+    series_id TEXT,
+    series_position INTEGER,
+    metadata JSON,
+    embeddings JSON
+);
+
+CREATE INDEX IF NOT EXISTS idx_content_published ON content(published_at DESC);
+CREATE INDEX IF NOT EXISTS idx_content_seen ON content(seen);
+CREATE INDEX IF NOT EXISTS idx_content_hidden ON content(hidden);
+
+-- Encodings (how to access content - URLs, deep links, etc.)
+
+CREATE TABLE IF NOT EXISTS encodings (
+    id TEXT PRIMARY KEY,
+    content_id TEXT NOT NULL REFERENCES content(id),
+    source_type TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    uri TEXT NOT NULL,
+    media_type TEXT,
+    metadata JSON,
+    discovered_at TEXT NOT NULL,
+    is_primary INTEGER DEFAULT 0,
+    UNIQUE(source_type, external_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_encodings_content ON encodings(content_id);
+CREATE INDEX IF NOT EXISTS idx_encodings_source ON encodings(source_type);
+CREATE INDEX IF NOT EXISTS idx_encodings_uri ON encodings(uri);
+CREATE INDEX IF NOT EXISTS idx_encodings_primary ON encodings(content_id, is_primary) WHERE is_primary = 1;
 """
 
 
@@ -322,67 +357,6 @@ def _row_to_creator(row: sqlite3.Row) -> Creator:
     )
 
 
-def _row_to_platform(row: sqlite3.Row) -> Platform:
-    """Convert a database row to a Platform."""
-    content_types = []
-    if row["content_types"]:
-        content_types = [ContentType(ct) for ct in json.loads(row["content_types"])]
-
-    capabilities = []
-    if row["capabilities"]:
-        capabilities = [PlatformCapability(c) for c in json.loads(row["capabilities"])]
-
-    url_patterns = []
-    if row["url_patterns"]:
-        url_patterns = json.loads(row["url_patterns"])
-
-    metadata = {}
-    if row["metadata"]:
-        metadata = json.loads(row["metadata"])
-
-    return Platform(
-        id=row["id"],
-        name=row["name"],
-        platform_type=row["platform_type"],
-        content_types=content_types,
-        capabilities=capabilities,
-        auth_required=bool(row["auth_required"]),
-        api_available=bool(row["api_available"]),
-        base_url=row["base_url"],
-        url_patterns=url_patterns,
-        metadata=metadata,
-        created_at=_str_to_datetime(row["created_at"]),
-    )
-
-
-def _row_to_discovery_source(row: sqlite3.Row) -> DiscoverySource:
-    """Convert a database row to a DiscoverySource."""
-    content_types = []
-    if row["content_types"]:
-        content_types = [ContentType(ct) for ct in json.loads(row["content_types"])]
-
-    typical_platforms = []
-    if row["typical_platforms"]:
-        typical_platforms = json.loads(row["typical_platforms"])
-
-    metadata = {}
-    if row["metadata"]:
-        metadata = json.loads(row["metadata"])
-
-    return DiscoverySource(
-        id=row["id"],
-        name=row["name"],
-        source_type=row["source_type"],
-        content_types=content_types,
-        typical_platforms=typical_platforms,
-        poll_url=row["poll_url"],
-        poll_interval_seconds=row["poll_interval_seconds"],
-        metadata=metadata,
-        created_at=_str_to_datetime(row["created_at"]),
-        last_polled_at=_str_to_datetime(row["last_polled_at"]) if row["last_polled_at"] else None,
-    )
-
-
 def _row_to_discovery_signal(row: sqlite3.Row) -> DiscoverySignal:
     """Convert a database row to a DiscoverySignal."""
     content_info = None
@@ -405,43 +379,10 @@ def _row_to_discovery_signal(row: sqlite3.Row) -> DiscoverySignal:
         source_id=row["source_id"],
         item_id=row["item_id"],
         content_info=content_info,
-        signal_type=SignalType(row["signal_type"]) if row["signal_type"] else SignalType.CURATED,
         rank=row["rank"],
         rating=row["rating"],
         context=row["context"],
-        recommender=row["recommender"],
         url=row["url"],
-        discovered_at=_str_to_datetime(row["discovered_at"]),
-        metadata=metadata,
-    )
-
-
-def _row_to_platform_instance(row: sqlite3.Row) -> PlatformInstance:
-    """Convert a database row to a PlatformInstance."""
-    quality_tiers = []
-    if row["quality_tiers"]:
-        quality_tiers = json.loads(row["quality_tiers"])
-
-    region_locks = []
-    if row["region_locks"]:
-        region_locks = json.loads(row["region_locks"])
-
-    metadata = {}
-    if row["metadata"]:
-        metadata = json.loads(row["metadata"])
-
-    return PlatformInstance(
-        id=row["id"],
-        item_id=row["item_id"],
-        platform_id=row["platform_id"],
-        platform_item_id=row["platform_item_id"],
-        url=row["url"],
-        availability=row["availability"],
-        quality_tiers=quality_tiers,
-        price=row["price"],
-        currency=row["currency"],
-        region_locks=region_locks,
-        match_confidence=row["match_confidence"],
         discovered_at=_str_to_datetime(row["discovered_at"]),
         metadata=metadata,
     )
@@ -474,6 +415,124 @@ def _row_to_attribution(row: sqlite3.Row) -> ItemAttribution:
     )
 
 
+def _row_to_retriever(row: sqlite3.Row) -> Retriever:
+    """Convert a database row to a Retriever."""
+    config = {}
+    try:
+        if row["config"]:
+            config = json.loads(row["config"])
+    except (KeyError, IndexError):
+        pass
+
+    # Build score if present
+    score = None
+    if row["score_value"] is not None:
+        score = RetrieverScore(
+            value=row["score_value"],
+            confidence=row["score_confidence"] or 0.0,
+            sample_size=row["score_sample_size"] or 0,
+            last_updated=_str_to_datetime(row["score_updated_at"]) if row["score_updated_at"] else datetime.utcnow(),
+        )
+
+    return Retriever(
+        id=row["id"],
+        display_name=row["display_name"],
+        kind=RetrieverKind(row["kind"]),
+        handler_type=row["handler_type"],
+        uri=row["uri"],
+        config=config,
+        poll_interval_seconds=row["poll_interval_seconds"],
+        last_invoked_at=_str_to_datetime(row["last_invoked_at"]) if row["last_invoked_at"] else None,
+        parent_id=row["parent_id"],
+        depth=row["depth"],
+        is_enabled=bool(row["is_enabled"]),
+        score=score,
+        created_at=_str_to_datetime(row["created_at"]),
+        updated_at=_str_to_datetime(row["updated_at"]),
+    )
+
+
+def _row_to_content(row: sqlite3.Row) -> Content:
+    """Convert a database row to a Content."""
+    # Parse creator_ids
+    creator_ids = []
+    try:
+        if row["creator_ids"]:
+            creator_ids = json.loads(row["creator_ids"])
+    except (KeyError, IndexError):
+        pass
+
+    # Parse canonical_ids
+    canonical_ids = {}
+    try:
+        if row["canonical_ids"]:
+            canonical_ids = json.loads(row["canonical_ids"])
+    except (KeyError, IndexError):
+        pass
+
+    # Parse metadata
+    metadata = {}
+    try:
+        if row["metadata"]:
+            metadata = json.loads(row["metadata"])
+    except (KeyError, IndexError):
+        pass
+
+    # Parse embeddings - convert dicts to Embedding objects
+    embeddings = []
+    try:
+        if row["embeddings"]:
+            raw_embeddings = json.loads(row["embeddings"])
+            for emb in raw_embeddings:
+                embeddings.append(Embedding(
+                    name=emb.get("name", "default"),
+                    type=emb.get("type", "text"),
+                    vector=emb.get("vector", []),
+                    model=emb.get("model", ""),
+                ))
+    except (KeyError, IndexError):
+        pass
+
+    return Content(
+        id=row["id"],
+        title=row["title"],
+        content_type=ContentType(row["content_type"]),
+        published_at=_str_to_datetime(row["published_at"]),
+        ingested_at=_str_to_datetime(row["ingested_at"]),
+        creator_ids=creator_ids,
+        consumption_type=ConsumptionType(row["consumption_type"]) if row["consumption_type"] else ConsumptionType.ONE_SHOT,
+        canonical_ids=canonical_ids,
+        seen=bool(row["seen"]),
+        hidden=bool(row["hidden"]),
+        series_id=row["series_id"],
+        series_position=row["series_position"],
+        metadata=metadata,
+        embeddings=embeddings,
+    )
+
+
+def _row_to_encoding(row: sqlite3.Row) -> Encoding:
+    """Convert a database row to an Encoding."""
+    metadata = {}
+    try:
+        if row["metadata"]:
+            metadata = json.loads(row["metadata"])
+    except (KeyError, IndexError):
+        pass
+
+    return Encoding(
+        id=row["id"],
+        content_id=row["content_id"],
+        source_type=row["source_type"],
+        external_id=row["external_id"],
+        uri=row["uri"],
+        media_type=row["media_type"],
+        metadata=metadata,
+        discovered_at=_str_to_datetime(row["discovered_at"]),
+        is_primary=bool(row["is_primary"]),
+    )
+
+
 class SQLiteStore(Store):
     """SQLite-backed store. Good for production single-user."""
 
@@ -490,6 +549,7 @@ class SQLiteStore(Store):
         self._conn.executescript(SCHEMA)
         self._conn.commit()
         self._migrate_schema()
+        self._migrate_items_to_content_on_startup()
 
     def _migrate_schema(self) -> None:
         """Apply any necessary schema migrations."""
@@ -548,6 +608,48 @@ class SQLiteStore(Store):
         if "external_id" not in attr_columns:
             self._conn.execute("ALTER TABLE item_attributions ADD COLUMN external_id TEXT")
             self._conn.commit()
+
+    def _migrate_items_to_content_on_startup(self) -> None:
+        """Auto-migrate any Items that don't have Content records yet.
+
+        This ensures no data is lost during the Item → Content+Encoding transition.
+        Runs once - uses a migration_version table to track completion.
+        """
+        # Create migration tracking table if not exists
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS migrations (
+                name TEXT PRIMARY KEY,
+                completed_at TEXT NOT NULL
+            )
+        """)
+        self._conn.commit()
+
+        # Check if this migration was already done
+        cursor = self._conn.execute(
+            "SELECT completed_at FROM migrations WHERE name = 'items_to_content_v1'"
+        )
+        if cursor.fetchone():
+            return  # Already migrated
+
+        # Check if migration is needed
+        cursor = self._conn.execute(
+            "SELECT COUNT(*) FROM items WHERE id NOT IN (SELECT id FROM content)"
+        )
+        to_migrate = cursor.fetchone()[0]
+
+        if to_migrate > 0:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"Auto-migrating {to_migrate} items to Content+Encoding...")
+            migrated = self.migrate_items_to_content()
+            logger.info(f"Auto-migration complete: {migrated} items migrated")
+
+        # Mark migration as complete
+        self._conn.execute(
+            "INSERT INTO migrations (name, completed_at) VALUES (?, ?)",
+            ("items_to_content_v1", _datetime_to_str(datetime.utcnow()))
+        )
+        self._conn.commit()
 
     # Sources
 
@@ -975,6 +1077,340 @@ class SQLiteStore(Store):
         cursor = self._conn.execute(f"SELECT COUNT(*) FROM items {where}", params)
         return cursor.fetchone()[0]
 
+    # Content (new model - abstract content independent of access method)
+
+    def upsert_content(self, content: Content) -> None:
+        """Insert or update content by ID."""
+        # Convert Embedding objects to dicts for JSON storage
+        embeddings_json = [
+            {"name": e.name, "type": e.type, "vector": e.vector, "model": e.model}
+            for e in content.embeddings
+        ]
+
+        self._conn.execute(
+            """
+            INSERT INTO content (
+                id, title, content_type, published_at, ingested_at,
+                creator_ids, consumption_type, canonical_ids,
+                seen, hidden, series_id, series_position, metadata, embeddings
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                title = excluded.title,
+                content_type = excluded.content_type,
+                published_at = excluded.published_at,
+                creator_ids = excluded.creator_ids,
+                consumption_type = excluded.consumption_type,
+                canonical_ids = excluded.canonical_ids,
+                seen = excluded.seen,
+                hidden = excluded.hidden,
+                series_id = excluded.series_id,
+                series_position = excluded.series_position,
+                metadata = excluded.metadata,
+                embeddings = excluded.embeddings
+            """,
+            (
+                content.id,
+                content.title,
+                content.content_type.value,
+                _datetime_to_str(content.published_at),
+                _datetime_to_str(content.ingested_at),
+                json.dumps(content.creator_ids),
+                content.consumption_type.value,
+                json.dumps(content.canonical_ids),
+                int(content.seen),
+                int(content.hidden),
+                content.series_id,
+                content.series_position,
+                json.dumps(content.metadata),
+                json.dumps(embeddings_json),
+            ),
+        )
+        self._conn.commit()
+
+    def get_content(self, content_id: str) -> Content | None:
+        """Get content by ID."""
+        cursor = self._conn.execute(
+            "SELECT * FROM content WHERE id = ?",
+            (content_id,),
+        )
+        row = cursor.fetchone()
+        return _row_to_content(row) if row else None
+
+    def get_contents(
+        self,
+        seen: bool | None = None,
+        hidden: bool | None = None,
+        source_type: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[Content]:
+        """Get content with optional filters."""
+        conditions = []
+        params: list = []
+
+        if seen is not None:
+            conditions.append("c.seen = ?")
+            params.append(int(seen))
+
+        if hidden is not None:
+            conditions.append("c.hidden = ?")
+            params.append(int(hidden))
+
+        # Source type requires a JOIN with encodings
+        if source_type is not None:
+            conditions.append("e.source_type = ?")
+            params.append(source_type)
+            where = "WHERE " + " AND ".join(conditions) if conditions else ""
+            params.extend([limit, offset])
+            cursor = self._conn.execute(
+                f"""
+                SELECT DISTINCT c.* FROM content c
+                INNER JOIN encodings e ON c.id = e.content_id
+                {where}
+                ORDER BY c.published_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                params,
+            )
+        else:
+            where = "WHERE " + " AND ".join(conditions) if conditions else ""
+            params.extend([limit, offset])
+            cursor = self._conn.execute(
+                f"SELECT * FROM content c {where} ORDER BY c.published_at DESC LIMIT ? OFFSET ?",
+                params,
+            )
+
+        return [_row_to_content(row) for row in cursor.fetchall()]
+
+    def get_content_by_canonical_id(self, id_type: str, id_value: str) -> Content | None:
+        """Find content by canonical ID (ISBN, IMDB, etc.)."""
+        cursor = self._conn.execute(
+            """
+            SELECT * FROM content
+            WHERE json_extract(canonical_ids, ?) = ?
+            """,
+            (f"$.{id_type}", id_value),
+        )
+        row = cursor.fetchone()
+        return _row_to_content(row) if row else None
+
+    def find_content_by_canonical_ids(self, canonical_ids: dict[str, str]) -> Content | None:
+        """Find existing content that matches any of the provided canonical IDs."""
+        for id_type, id_value in canonical_ids.items():
+            content = self.get_content_by_canonical_id(id_type, id_value)
+            if content:
+                return content
+        return None
+
+    def mark_content_seen(self, content_id: str, seen: bool = True) -> None:
+        """Mark content as seen or unseen."""
+        self._conn.execute(
+            "UPDATE content SET seen = ? WHERE id = ?",
+            (int(seen), content_id),
+        )
+        self._conn.commit()
+
+    def mark_content_hidden(self, content_id: str, hidden: bool = True) -> None:
+        """Mark content as hidden or unhidden."""
+        self._conn.execute(
+            "UPDATE content SET hidden = ? WHERE id = ?",
+            (int(hidden), content_id),
+        )
+        self._conn.commit()
+
+    def count_content(
+        self,
+        seen: bool | None = None,
+        hidden: bool | None = None,
+    ) -> int:
+        """Count content matching the filters."""
+        conditions = []
+        params: list = []
+
+        if seen is not None:
+            conditions.append("seen = ?")
+            params.append(int(seen))
+
+        if hidden is not None:
+            conditions.append("hidden = ?")
+            params.append(int(hidden))
+
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+
+        cursor = self._conn.execute(f"SELECT COUNT(*) FROM content {where}", params)
+        return cursor.fetchone()[0]
+
+    # Encodings (how to access content - URLs, deep links, etc.)
+
+    def add_encoding(self, encoding: Encoding) -> None:
+        """Add a new encoding for content."""
+        self._conn.execute(
+            """
+            INSERT INTO encodings (
+                id, content_id, source_type, external_id, uri,
+                media_type, metadata, discovered_at, is_primary
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source_type, external_id) DO UPDATE SET
+                uri = excluded.uri,
+                media_type = excluded.media_type,
+                metadata = excluded.metadata
+            """,
+            (
+                encoding.id,
+                encoding.content_id,
+                encoding.source_type,
+                encoding.external_id,
+                encoding.uri,
+                encoding.media_type,
+                json.dumps(encoding.metadata),
+                _datetime_to_str(encoding.discovered_at),
+                int(encoding.is_primary),
+            ),
+        )
+        self._conn.commit()
+
+    def get_encoding(self, encoding_id: str) -> Encoding | None:
+        """Get an encoding by ID."""
+        cursor = self._conn.execute(
+            "SELECT * FROM encodings WHERE id = ?",
+            (encoding_id,),
+        )
+        row = cursor.fetchone()
+        return _row_to_encoding(row) if row else None
+
+    def get_encoding_by_external_id(self, source_type: str, external_id: str) -> Encoding | None:
+        """Get an encoding by source type and external ID."""
+        cursor = self._conn.execute(
+            "SELECT * FROM encodings WHERE source_type = ? AND external_id = ?",
+            (source_type, external_id),
+        )
+        row = cursor.fetchone()
+        return _row_to_encoding(row) if row else None
+
+    def get_encoding_by_uri(self, uri: str) -> Encoding | None:
+        """Get an encoding by URI (URL or deep link)."""
+        cursor = self._conn.execute(
+            "SELECT * FROM encodings WHERE uri = ?",
+            (uri,),
+        )
+        row = cursor.fetchone()
+        return _row_to_encoding(row) if row else None
+
+    def get_encodings_for_content(self, content_id: str) -> list[Encoding]:
+        """Get all encodings for a piece of content."""
+        cursor = self._conn.execute(
+            "SELECT * FROM encodings WHERE content_id = ? ORDER BY is_primary DESC, discovered_at ASC",
+            (content_id,),
+        )
+        return [_row_to_encoding(row) for row in cursor.fetchall()]
+
+    def get_primary_encoding(self, content_id: str) -> Encoding | None:
+        """Get the primary (first discovered) encoding for content."""
+        cursor = self._conn.execute(
+            "SELECT * FROM encodings WHERE content_id = ? AND is_primary = 1",
+            (content_id,),
+        )
+        row = cursor.fetchone()
+        if row:
+            return _row_to_encoding(row)
+
+        # Fallback: return first encoding if no primary is marked
+        cursor = self._conn.execute(
+            "SELECT * FROM encodings WHERE content_id = ? ORDER BY discovered_at ASC LIMIT 1",
+            (content_id,),
+        )
+        row = cursor.fetchone()
+        return _row_to_encoding(row) if row else None
+
+    # Convenience methods for Content + Encoding
+
+    def get_content_with_encodings(
+        self, content_id: str
+    ) -> tuple[Content, list[Encoding]] | None:
+        """Get content along with all its encodings."""
+        content = self.get_content(content_id)
+        if not content:
+            return None
+        encodings = self.get_encodings_for_content(content_id)
+        return (content, encodings)
+
+    def migrate_items_to_content(self) -> int:
+        """Migrate existing Item records to Content + Encoding.
+
+        For each Item:
+        - Creates a Content record with the same ID
+        - Creates an Encoding record linking to the Content
+
+        Returns count of items migrated.
+        """
+        # Get all items that haven't been migrated yet
+        cursor = self._conn.execute(
+            """
+            SELECT * FROM items
+            WHERE id NOT IN (SELECT id FROM content)
+            """
+        )
+        items = cursor.fetchall()
+
+        migrated = 0
+        for row in items:
+            item = _row_to_item(row)
+
+            # Create Content from Item
+            # Convert old embeddings format (list of dicts) to Embedding objects
+            embeddings = []
+            for emb in item.embeddings:
+                embeddings.append(Embedding(
+                    name=emb.get("name", "default"),
+                    type=emb.get("type", "text"),
+                    vector=emb.get("vector", []),
+                    model=emb.get("model", ""),
+                ))
+
+            # Build creator_ids list from single creator_id
+            creator_ids = []
+            if item.creator_id:
+                creator_ids.append(item.creator_id)
+
+            content = Content(
+                id=item.id,  # Keep same ID for backwards compat
+                title=item.title,
+                content_type=item.content_type,
+                published_at=item.published_at,
+                ingested_at=item.ingested_at,
+                creator_ids=creator_ids,
+                consumption_type=item.consumption_type,
+                canonical_ids=item.canonical_ids,
+                seen=item.seen,
+                hidden=item.hidden,
+                series_id=item.series_id,
+                series_position=item.series_position,
+                metadata=item.metadata,
+                embeddings=embeddings,
+            )
+
+            # Create Encoding from Item's source info
+            encoding = Encoding(
+                id=_generate_id(),
+                content_id=item.id,
+                source_type=item.source_id,  # source_id becomes source_type
+                external_id=item.external_id,
+                uri=item.url,
+                media_type=None,  # Not available in old model
+                metadata={},  # Encoding-specific metadata not in old model
+                discovered_at=item.ingested_at,
+                is_primary=True,
+            )
+
+            # Insert Content and Encoding
+            self.upsert_content(content)
+            self.add_encoding(encoding)
+            migrated += 1
+
+        return migrated
+
     # Feedback events
 
     def add_feedback_event(self, event: FeedbackEvent) -> None:
@@ -1336,6 +1772,307 @@ class SQLiteStore(Store):
             (source_id, limit),
         )
         return [_row_to_item(row) for row in cursor.fetchall()]
+
+    # Discovery signals
+
+    def add_discovery_signal(self, signal: DiscoverySignal) -> DiscoverySignal:
+        """Add a discovery signal. Returns the created signal."""
+        if not signal.id:
+            signal.id = _generate_id()
+
+        # Serialize content_info
+        content_info_json = None
+        if signal.content_info:
+            content_info_json = json.dumps({
+                "content_type": signal.content_info.content_type.value,
+                "title": signal.content_info.title,
+                "creators": signal.content_info.creators,
+                "year": signal.content_info.year,
+                "external_ids": signal.content_info.external_ids,
+            })
+
+        self._conn.execute(
+            """
+            INSERT INTO discovery_signals (
+                id, source_id, item_id, content_info,
+                rank, rating, context, url,
+                discovered_at, metadata
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                signal.id,
+                signal.source_id,
+                signal.item_id,
+                content_info_json,
+                signal.rank,
+                signal.rating,
+                signal.context,
+                signal.url,
+                _datetime_to_str(signal.discovered_at),
+                json.dumps(signal.metadata) if signal.metadata else None,
+            ),
+        )
+        self._conn.commit()
+        return signal
+
+    def get_discovery_signals(
+        self,
+        item_id: str | None = None,
+        source_id: str | None = None,
+        limit: int = 100,
+    ) -> list[DiscoverySignal]:
+        """Get discovery signals with optional filters."""
+        conditions = []
+        params: list = []
+
+        if item_id is not None:
+            conditions.append("item_id = ?")
+            params.append(item_id)
+
+        if source_id is not None:
+            conditions.append("source_id = ?")
+            params.append(source_id)
+
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+
+        query = f"""
+            SELECT * FROM discovery_signals
+            {where}
+            ORDER BY discovered_at DESC
+            LIMIT ?
+        """
+        params.append(limit)
+
+        cursor = self._conn.execute(query, params)
+        return [_row_to_discovery_signal(row) for row in cursor.fetchall()]
+
+    def get_unresolved_signals(self, limit: int = 100) -> list[DiscoverySignal]:
+        """Get signals that haven't been matched to items yet."""
+        cursor = self._conn.execute(
+            """
+            SELECT * FROM discovery_signals
+            WHERE item_id IS NULL
+            ORDER BY discovered_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [_row_to_discovery_signal(row) for row in cursor.fetchall()]
+
+    def resolve_signal(self, signal_id: str, item_id: str) -> None:
+        """Link a discovery signal to a resolved item."""
+        self._conn.execute(
+            "UPDATE discovery_signals SET item_id = ? WHERE id = ?",
+            (item_id, signal_id),
+        )
+        self._conn.commit()
+
+    # Retrievers
+
+    def add_retriever(self, retriever: Retriever) -> Retriever:
+        """Add a new retriever. Returns the created Retriever with ID."""
+        if not retriever.id:
+            retriever.id = _generate_id()
+
+        now = datetime.utcnow()
+        retriever.created_at = now
+        retriever.updated_at = now
+
+        self._conn.execute(
+            """
+            INSERT INTO retrievers (
+                id, display_name, kind, handler_type, uri, config,
+                poll_interval_seconds, last_invoked_at, parent_id, depth,
+                is_enabled, score_value, score_confidence, score_sample_size,
+                score_updated_at, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                retriever.id,
+                retriever.display_name,
+                retriever.kind.value,
+                retriever.handler_type,
+                retriever.uri,
+                json.dumps(retriever.config) if retriever.config else None,
+                retriever.poll_interval_seconds,
+                _datetime_to_str(retriever.last_invoked_at) if retriever.last_invoked_at else None,
+                retriever.parent_id,
+                retriever.depth,
+                int(retriever.is_enabled),
+                retriever.score.value if retriever.score else None,
+                retriever.score.confidence if retriever.score else None,
+                retriever.score.sample_size if retriever.score else None,
+                _datetime_to_str(retriever.score.last_updated) if retriever.score else None,
+                _datetime_to_str(retriever.created_at),
+                _datetime_to_str(retriever.updated_at),
+            ),
+        )
+        self._conn.commit()
+        return retriever
+
+    def get_retriever(self, retriever_id: str) -> Retriever | None:
+        """Get a retriever by ID."""
+        cursor = self._conn.execute("SELECT * FROM retrievers WHERE id = ?", (retriever_id,))
+        row = cursor.fetchone()
+        return _row_to_retriever(row) if row else None
+
+    def get_retriever_by_uri(self, uri: str) -> Retriever | None:
+        """Get a retriever by its URI."""
+        cursor = self._conn.execute("SELECT * FROM retrievers WHERE uri = ?", (uri,))
+        row = cursor.fetchone()
+        return _row_to_retriever(row) if row else None
+
+    def list_retrievers(
+        self,
+        parent_id: str | None = None,
+        kind: str | None = None,
+        enabled_only: bool = True,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[Retriever]:
+        """List retrievers with optional filters."""
+        conditions = []
+        params: list = []
+
+        if parent_id is not None:
+            conditions.append("parent_id = ?")
+            params.append(parent_id)
+
+        if kind is not None:
+            conditions.append("kind = ?")
+            params.append(kind)
+
+        if enabled_only:
+            conditions.append("is_enabled = 1")
+
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+
+        query = f"""
+            SELECT * FROM retrievers
+            {where}
+            ORDER BY created_at DESC
+            LIMIT ? OFFSET ?
+        """
+        params.extend([limit, offset])
+
+        cursor = self._conn.execute(query, params)
+        return [_row_to_retriever(row) for row in cursor.fetchall()]
+
+    def get_children(self, parent_id: str) -> list[Retriever]:
+        """Get child retrievers of a parent."""
+        cursor = self._conn.execute(
+            "SELECT * FROM retrievers WHERE parent_id = ? AND is_enabled = 1 ORDER BY display_name",
+            (parent_id,),
+        )
+        return [_row_to_retriever(row) for row in cursor.fetchall()]
+
+    def update_retriever(self, retriever: Retriever) -> None:
+        """Update retriever metadata and config."""
+        retriever.updated_at = datetime.utcnow()
+        self._conn.execute(
+            """
+            UPDATE retrievers SET
+                display_name = ?,
+                kind = ?,
+                handler_type = ?,
+                uri = ?,
+                config = ?,
+                poll_interval_seconds = ?,
+                parent_id = ?,
+                depth = ?,
+                is_enabled = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                retriever.display_name,
+                retriever.kind.value,
+                retriever.handler_type,
+                retriever.uri,
+                json.dumps(retriever.config) if retriever.config else None,
+                retriever.poll_interval_seconds,
+                retriever.parent_id,
+                retriever.depth,
+                int(retriever.is_enabled),
+                _datetime_to_str(retriever.updated_at),
+                retriever.id,
+            ),
+        )
+        self._conn.commit()
+
+    def update_retriever_invoked(self, retriever_id: str, invoked_at: datetime) -> None:
+        """Update the last_invoked_at timestamp."""
+        self._conn.execute(
+            "UPDATE retrievers SET last_invoked_at = ?, updated_at = ? WHERE id = ?",
+            (_datetime_to_str(invoked_at), _datetime_to_str(datetime.utcnow()), retriever_id),
+        )
+        self._conn.commit()
+
+    def update_retriever_score(self, retriever_id: str, score: RetrieverScore) -> None:
+        """Update a retriever's quality score."""
+        self._conn.execute(
+            """
+            UPDATE retrievers SET
+                score_value = ?,
+                score_confidence = ?,
+                score_sample_size = ?,
+                score_updated_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                score.value,
+                score.confidence,
+                score.sample_size,
+                _datetime_to_str(score.last_updated),
+                _datetime_to_str(datetime.utcnow()),
+                retriever_id,
+            ),
+        )
+        self._conn.commit()
+
+    def enable_retriever(self, retriever_id: str, enabled: bool = True) -> None:
+        """Enable or disable a retriever."""
+        self._conn.execute(
+            "UPDATE retrievers SET is_enabled = ?, updated_at = ? WHERE id = ?",
+            (int(enabled), _datetime_to_str(datetime.utcnow()), retriever_id),
+        )
+        self._conn.commit()
+
+    def delete_retriever(self, retriever_id: str, delete_children: bool = True) -> int:
+        """Delete a retriever and optionally its children. Returns count deleted."""
+        count = 0
+
+        if delete_children:
+            # Recursively delete children
+            children = self.get_children(retriever_id)
+            for child in children:
+                count += self.delete_retriever(child.id, delete_children=True)
+
+        self._conn.execute("DELETE FROM retrievers WHERE id = ?", (retriever_id,))
+        self._conn.commit()
+        return count + 1
+
+    def get_retrievers_needing_poll(self, limit: int = 10) -> list[Retriever]:
+        """Get POLL retrievers that are due for polling."""
+        now = datetime.utcnow()
+        cursor = self._conn.execute(
+            """
+            SELECT * FROM retrievers
+            WHERE kind = 'poll'
+              AND is_enabled = 1
+              AND (
+                  last_invoked_at IS NULL
+                  OR datetime(last_invoked_at, '+' || poll_interval_seconds || ' seconds') < datetime(?)
+              )
+            ORDER BY last_invoked_at ASC NULLS FIRST
+            LIMIT ?
+            """,
+            (_datetime_to_str(now), limit),
+        )
+        return [_row_to_retriever(row) for row in cursor.fetchall()]
 
     # Lifecycle
 
